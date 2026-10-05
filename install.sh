@@ -19,6 +19,10 @@ if systemctl --user cat "$SERVICE.service" >/dev/null 2>&1; then
   mkdir -p "$HOME/.config/systemd/user/$SERVICE.service.d"
   cat > "$HOME/.config/systemd/user/$SERVICE.service.d/10-auto-hardware.conf" <<EOF
 [Service]
+Environment=LLAMA_HOME=$HOME_DIR
+Environment=LLAMA_MODELS_INI=$INI
+Environment=LLAMA_SERVER=$SERVER
+Environment=LLAMA_MODELCTL_STATE=$HOME_DIR/.config/llama-modelctl/state.json
 ExecStartPre=/usr/local/bin/llama-hw-select
 EOF
   systemctl --user daemon-reload
@@ -29,6 +33,10 @@ elif systemctl cat "$SERVICE.service" >/dev/null 2>&1; then
   sudo mkdir -p "/etc/systemd/system/$SERVICE.service.d"
   sudo tee "/etc/systemd/system/$SERVICE.service.d/10-auto-hardware.conf" >/dev/null <<EOF
 [Service]
+Environment=LLAMA_HOME=$HOME_DIR
+Environment=LLAMA_MODELS_INI=$INI
+Environment=LLAMA_SERVER=$SERVER
+Environment=LLAMA_MODELCTL_STATE=$HOME_DIR/.config/llama-modelctl/state.json
 ExecStartPre=/usr/local/bin/llama-hw-select
 EOF
   sudo systemctl daemon-reload

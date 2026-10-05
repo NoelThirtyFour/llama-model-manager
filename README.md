@@ -109,7 +109,7 @@ New models default to **automatic context fitting** with a 4096-token minimum.
 Override that while adding:
 
 ```bash
-llama-modelctl add my-model USER/REPO --file '*Q4_K_M*.gguf \
+llama-modelctl add my-model USER/REPO --file '*Q4_K_M*.gguf' \
   --ctx auto --fit-ctx 16384
 ```
 
