@@ -15,6 +15,8 @@ SERVICE = os.environ.get('LLAMA_SERVICE', 'llama-main')
 PROTECTED = {'device','fit-target','n-gpu-layers','main-gpu','split-mode','fit'}
 CACHE_KEYS = {'cache-type-k','cache-type-v','cache-type-k-draft','cache-type-v-draft'}
 CACHE_TYPES = {'f32','f16','bf16','q8_0','q5_0','q5_1','q4_0','q4_1','iq4_nl'}
+BACKEND_MODES = {'auto','cuda','hip','rocm','vulkan','cpu'}
+PERF_PROFILES = {'balanced','throughput','capacity'}
 
 
 def die(msg):
@@ -221,16 +223,133 @@ def cmd_set(a):
     if a.key.lower() in PROTECTED: die(f'{a.key} is boot-managed; use hardware auto-selection')
     if a.key.lower() in CACHE_KEYS and a.value.lower() not in CACHE_TYPES: print('WARNING: unusual cache type',file=sys.stderr)
     backup_ini(); INI.write_text(set_key(read_ini(),a.name,a.key,a.value),encoding='utf-8')
+    if a.key.lower() in {'cache-type-k','cache-type-v','batch-size','ubatch-size'}:
+        st=load_state(); ms=st.setdefault('models',{}).setdefault(a.name,{})
+        if a.key.lower() in {'cache-type-k','cache-type-v'}:
+            ms.setdefault('cache_pref',{})[a.key.lower()] = a.value
+        else:
+            ms.setdefault('perf_pref',{})[a.key.lower()] = a.value
+        save_state(st)
     if not a.no_restart: restart()
 def cmd_unset(a):
     if a.key.lower() in {'model','alias'}: die('refusing to remove required key')
     backup_ini(); INI.write_text(unset_key(read_ini(),a.name,a.key),encoding='utf-8')
+    if a.key.lower() in {'cache-type-k','cache-type-v','batch-size','ubatch-size'}:
+        st=load_state(); ms=st.setdefault('models',{}).setdefault(a.name,{})
+        bucket='cache_pref' if a.key.lower() in {'cache-type-k','cache-type-v'} else 'perf_pref'
+        pref=ms.get(bucket,{}); pref.pop(a.key.lower(),None)
+        if not pref: ms.pop(bucket,None)
+        save_state(st)
     if not a.no_restart: restart()
+def cmd_backend(a):
+    st=load_state(); hw=st.setdefault('hardware',{})
+    if a.mode is None:
+        print('backend =', hw.get('backend','auto'))
+        if hw.get('device'): print('device =', hw['device'])
+        print('profile =', hw.get('profile','balanced'))
+        return
+    mode=a.mode.lower()
+    if mode not in BACKEND_MODES: die('backend must be auto, cuda, hip/rocm, vulkan or cpu')
+    hw['backend']='rocm' if mode=='hip' else mode
+    if a.device:
+        hw['device']=a.device
+    else:
+        hw.pop('device',None)
+    save_state(st)
+    selector=Path('/usr/local/bin/llama-hw-select')
+    if selector.exists(): run([selector])
+    if not a.no_restart: restart()
+
+
+def cmd_profile(a):
+    st=load_state(); hw=st.setdefault('hardware',{})
+    if a.profile is None:
+        print(hw.get('profile','balanced')); return
+    if a.profile not in PERF_PROFILES: die('profile must be balanced, throughput or capacity')
+    hw['profile']=a.profile; save_state(st)
+    selector=Path('/usr/local/bin/llama-hw-select')
+    if selector.exists(): run([selector])
+    if not a.no_restart: restart()
+
+
+def _opencode_model_name(section, vals):
+    alias=vals.get('alias','').strip()
+    if alias and ',' not in alias and ' ' not in alias:
+        return alias
+    return section
+
+
+def cmd_export_opencode(a):
+    txt=read_ini(); st=load_state(); models={}
+    warnings=[]
+    for name in re.findall(r'(?m)^\[([^]]+)\]\s*$',txt):
+        if name=='*': continue
+        sec=get_section(txt,name); v=values(sec)
+        if v.get('embeddings','').lower() in {'1','true','on','yes'} or v.get('reranking','').lower() in {'1','true','on','yes'}:
+            continue
+        if not v.get('model'): continue
+        display_name=_opencode_model_name(name,v)
+        ms=st.get('models',{}).get(name,{})
+        if ms.get('ctx_mode')=='fixed':
+            context=int(ms.get('ctx_size', v.get('ctx-size', 32768)))
+        elif ms.get('ctx_mode')=='auto':
+            # Conservative guaranteed minimum for auto-fit models.
+            context=int(a.auto_context or ms.get('fit_ctx', v.get('fit-ctx', 4096)))
+        else:
+            context=int(v.get('ctx-size', v.get('fit-ctx', 32768)))
+        output=int(v.get('n-predict', 8192))
+        mm=v.get('mmproj')
+        vision=False
+        if mm:
+            if Path(mm).exists(): vision=True
+            else: warnings.append(f'{name}: mmproj missing: {mm}')
+        models[name]={
+            'modelID': name,
+            'name': display_name,
+            'capabilities': {
+                'tools': True,
+                'input': ['text','image'] if vision else ['text'],
+                'output': ['text'],
+            },
+            'limit': {'context': context, 'output': output},
+        }
+    cfg={
+        '$schema':'https://opencode.ai/config.json',
+        'providers':{
+            a.provider:{
+                'name':a.name,
+                'package':'@opencode/ai/providers/openai-compatible',
+                'settings':{'baseURL':a.base_url.rstrip('/')},
+                'models':models,
+            }
+        }
+    }
+    if a.default_model:
+        if a.default_model not in models: die(f'default model not exported: {a.default_model}')
+        cfg['model']=f'{a.provider}/{a.default_model}'
+    out=json.dumps(cfg,indent=2,ensure_ascii=False)+'\n'
+    if a.output:
+        Path(a.output).expanduser().write_text(out,encoding='utf-8')
+        print(f'Wrote {a.output} ({len(models)} models)')
+    else:
+        sys.stdout.write(out)
+    for w in warnings: print('WARNING:',w,file=sys.stderr)
+
+
 def cmd_devices(a): run([str(SERVER),'--list-devices'])
 def cmd_update(a):
     if not (REPO/'.git').exists(): die(f'{REPO} is not a git repo')
+    requested={x.strip().lower() for x in a.backends.split(',') if x.strip()}
+    if 'all' in requested: requested={'cuda','hip','vulkan'}
+    requested={'hip' if x=='rocm' else x for x in requested}
+    bad=requested-{'cuda','hip','vulkan','cpu'}
+    if bad: die('unknown build backend(s): '+', '.join(sorted(bad)))
     run(['git','-C',REPO,'pull','--ff-only'])
-    args=['cmake','-S',REPO,'-B',BUILD,'-G','Ninja','-DCMAKE_BUILD_TYPE=Release','-DGGML_BACKEND_DL=ON','-DGGML_CUDA=ON','-DGGML_HIP=ON','-DGGML_VULKAN=ON','-DGGML_NATIVE=OFF']
+    args=['cmake','-S',REPO,'-B',BUILD,'-G','Ninja','-DCMAKE_BUILD_TYPE=Release','-DGGML_BACKEND_DL=ON',
+          f"-DGGML_CUDA={'ON' if 'cuda' in requested else 'OFF'}",
+          f"-DGGML_HIP={'ON' if 'hip' in requested else 'OFF'}",
+          f"-DGGML_VULKAN={'ON' if 'vulkan' in requested else 'OFF'}",
+          '-DGGML_NATIVE=OFF']
     run(args); run(['cmake','--build',BUILD,'-j',str(os.cpu_count() or 4)])
     run([str(SERVER),'--list-devices'])
     if not a.no_restart: restart()
@@ -240,11 +359,14 @@ def main():
     q=sp.add_parser('list'); q.set_defaults(func=cmd_list)
     q=sp.add_parser('show'); q.add_argument('name'); q.set_defaults(func=cmd_show)
     q=sp.add_parser('devices'); q.set_defaults(func=cmd_devices)
+    q=sp.add_parser('backend'); q.add_argument('mode',nargs='?',choices=sorted(BACKEND_MODES)); q.add_argument('--device',help='exact device id, e.g. CUDA1 or Vulkan1'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_backend)
+    q=sp.add_parser('profile'); q.add_argument('profile',nargs='?',choices=sorted(PERF_PROFILES)); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_profile)
     q=sp.add_parser('add'); q.add_argument('name'); q.add_argument('source'); q.add_argument('--file'); q.add_argument('--revision'); q.add_argument('--mmproj'); q.add_argument('--no-mmproj',action='store_true'); q.add_argument('--ctx',default='auto'); q.add_argument('--fit-ctx',type=int,default=4096); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_add)
     q=sp.add_parser('remove'); q.add_argument('name'); q.add_argument('--files',action='store_true'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_remove)
     q=sp.add_parser('ctx'); q.add_argument('name'); q.add_argument('value',nargs='?'); q.add_argument('--fit-ctx',type=int,default=4096); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_ctx)
     q=sp.add_parser('set'); q.add_argument('name'); q.add_argument('key'); q.add_argument('value'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_set)
     q=sp.add_parser('unset'); q.add_argument('name'); q.add_argument('key'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_unset)
-    q=sp.add_parser('update'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_update)
+    q=sp.add_parser('export-opencode'); q.add_argument('--base-url',required=True,help='remote llama-server OpenAI-compatible URL, e.g. http://192.168.1.50:8080/v1'); q.add_argument('--output','-o'); q.add_argument('--provider',default='llama-local'); q.add_argument('--name',default='llama.cpp'); q.add_argument('--default-model'); q.add_argument('--auto-context',type=int,help='context limit exported for auto-fit models; default is conservative fit-ctx minimum'); q.set_defaults(func=cmd_export_opencode)
+    q=sp.add_parser('update'); q.add_argument('--backends',default='all',help='all or comma list: cuda,hip/rocm,vulkan,cpu'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_update)
     a=p.parse_args(); a.func(a)
 if __name__=='__main__': main()

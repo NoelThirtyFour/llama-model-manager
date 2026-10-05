@@ -1,149 +1,35 @@
 # llama-model-manager
 
-`llama-model-manager` is a lightweight Linux toolkit for running `llama.cpp` on machines where the available GPU may change between boots.
+A small Linux toolkit for running `llama.cpp` with one model catalog across changing hardware.
 
-It is designed especially for setups such as:
+It is designed for machines such as an AMD Ryzen AI HX370 / Radeon 890M host with an optional NVIDIA eGPU, but it also supports fixed CUDA, HIP/ROCm, Vulkan, and CPU modes.
 
-- AMD Ryzen AI HX370 / Radeon 890M with large UMA memory
-- Optional NVIDIA eGPU
-- RTX 3060, RTX 3090, RTX 4090, or multiple CUDA GPUs
-- CUDA, ROCm/HIP, and Vulkan available from the same `llama.cpp` build
+## Highlights
 
-The goal is simple:
+- Keeps `~/llama-models.ini` as the source of model presets.
+- Selects hardware automatically at service start, or lets you force a backend.
+- Supports CUDA, HIP/ROCm, Vulkan, and CPU runtime modes.
+- Chooses the CUDA device with the most free VRAM in automatic mode.
+- Uses `n-gpu-layers = auto` and `fit = on` instead of hard-coded layer counts.
+- Forces F16/F16 KV cache on AMD/HX370 and restores per-model Q8/Q4/F16 preferences on NVIDIA.
+- Supports fixed or auto-fit context sizes per model.
+- Downloads GGUF models from local files or Hugging Face, including shards and `mmproj`.
+- Updates and rebuilds `llama.cpp` with selectable build backends.
+- Exports an OpenCode JSON configuration for a remote OpenCode machine.
 
-> Keep one model configuration and let the machine adapt automatically to the GPU available at boot.
-
----
-
-## Features
-
-### Automatic GPU selection
-
-At service startup, the tool runs:
-
-```bash
-llama-server --list-devices
-```
-
-and automatically selects the best available backend.
-
-Priority:
-
-1. CUDA
-2. ROCm / HIP
-3. NVIDIA Vulkan
-4. Other Vulkan devices
-
-If multiple CUDA GPUs are available, the GPU with the most free VRAM is selected.
-
-Example:
-
-```text
-CUDA0: NVIDIA GeForce RTX 3060
-ROCm0: AMD Radeon Graphics
-Vulkan0: NVIDIA GeForce RTX 3060
-Vulkan1: AMD Radeon Graphics
-```
-
-With the RTX connected:
-
-```text
-CUDA0
-```
-
-Without the RTX:
-
-```text
-ROCm0
-```
-
-No model configuration needs to be rewritten manually.
-
----
-
-## Automatic memory fitting
-
-The project uses the memory fitting features built into recent versions of `llama.cpp`:
-
-```ini
-n-gpu-layers = auto
-fit = on
-```
-
-This means GPU layer counts are not hard-coded.
-
-For example:
-
-```text
-RTX 3060 12 GB
-    ↓
-partial GPU offload if required
-
-RTX 3090 24 GB
-    ↓
-more layers or full GPU offload
-
-HX370 / Radeon 890M / large UMA
-    ↓
-ROCm with automatic memory fitting
-```
-
-The actual result depends on:
-
-- model size
-- quantization
-- KV cache type
-- context size
-- batch size
-- available VRAM
-
----
-
-## Automatic or fixed context sizes
-
-Each model can use either a fixed context size or automatic context fitting.
-
-### Automatic
-
-```bash
-llama-modelctl ctx qwen38-iq3s auto
-```
-
-With a minimum context:
-
-```bash
-llama-modelctl ctx qwen38-iq3s auto --fit-ctx 16384
-```
-
-This lets `llama.cpp` adapt both context size and GPU offload to the current machine.
-
-### Fixed
-
-```bash
-llama-modelctl ctx qwen38-iq3s 65536
-```
-
-This keeps the context exactly at 65,536 tokens.
-
----
-
-# Installation
-
-Default layout:
+## Default layout
 
 ```text
 ~/llama.cpp
+~/llama.cpp/build-all/bin/llama-server
 ~/llama-models.ini
 /models-local
+systemd service: llama-main
 ```
 
-The expected `llama.cpp` binary is:
+Paths can be overridden with `LLAMA_CPP_DIR`, `LLAMA_SERVER`, `LLAMA_MODELS_INI`, `LLAMA_MODELS_DIR`, `LLAMA_SERVICE`, and `LLAMA_MODELCTL_STATE`.
 
-```text
-~/llama.cpp/build-all/bin/llama-server
-```
-
-Install:
+## Install
 
 ```bash
 git clone https://github.com/NoelThirtyFour/llama-model-manager.git
@@ -151,379 +37,280 @@ cd llama-model-manager
 ./install.sh
 ```
 
-The installer adds:
+The installer adds `/usr/local/bin/llama-modelctl` and `/usr/local/bin/llama-hw-select`, then installs an `ExecStartPre` hook for `llama-main` so hardware selection runs automatically at boot/service start.
 
-```text
-/usr/local/bin/llama-modelctl
-/usr/local/bin/llama-hw-select
+## Runtime backend selection
+
+Automatic mode is the default:
+
+```bash
+llama-modelctl backend auto
 ```
 
-and integrates automatic hardware detection with:
+Force CUDA:
 
-```text
-llama-main.service
+```bash
+llama-modelctl backend cuda
 ```
 
-using:
+Force HIP/ROCm:
+
+```bash
+llama-modelctl backend hip
+# or
+llama-modelctl backend rocm
+```
+
+Force Vulkan:
+
+```bash
+llama-modelctl backend vulkan
+```
+
+CPU fallback:
+
+```bash
+llama-modelctl backend cpu
+```
+
+On multi-GPU systems, pin an exact device:
+
+```bash
+llama-modelctl backend cuda --device CUDA1
+llama-modelctl backend vulkan --device Vulkan1
+```
+
+Show the current policy:
+
+```bash
+llama-modelctl backend
+```
+
+### Automatic priority
+
+When `backend auto` is active, the selector uses:
+
+1. CUDA device with the most free VRAM
+2. ROCm device with the most free memory
+3. NVIDIA Vulkan
+4. Other Vulkan
+
+## Performance policy
+
+Three runtime policies are available:
+
+```bash
+llama-modelctl profile balanced
+llama-modelctl profile throughput
+llama-modelctl profile capacity
+```
+
+`balanced` is the default.
+
+`throughput` is an experimental NVIDIA-oriented policy that uses a tighter VRAM fit target and runtime `batch-size = 128` / `ubatch-size = 128`. Original per-model batch preferences are saved and restored when leaving this mode.
+
+`capacity` keeps model-specific batch settings and uses a more aggressive memory-capacity fit target.
+
+These policies are intentionally conservative helpers, not universal benchmark winners. Use `llama-bench` for model-specific tuning.
+
+## HX370 / AMD KV policy
+
+On ROCm or AMD Vulkan runtime:
 
 ```ini
-[Service]
-ExecStartPre=/usr/local/bin/llama-hw-select
+cache-type-k = f16
+cache-type-v = f16
 ```
 
-The GPU is therefore detected automatically whenever `llama-main` starts.
+is forced for runtime stability/performance.
 
----
+If a model normally uses Q8 or Q4 KV cache, that preference is stored in `~/.config/llama-modelctl/state.json` and restored automatically when CUDA/NVIDIA becomes active again.
 
-# Model management
+## Model commands
 
-## List models
+List models:
 
 ```bash
 llama-modelctl list
 ```
 
-## Show a model configuration
+Inspect a model:
 
 ```bash
 llama-modelctl show qwen38-iq3s
 ```
 
-## Show detected devices
+Show detected devices:
 
 ```bash
 llama-modelctl devices
 ```
 
----
+### Add from Hugging Face
 
-# Add models
-
-Models can be added from either a local GGUF file or Hugging Face.
-
-## Hugging Face URL
+Direct URL:
 
 ```bash
 llama-modelctl add qwen38-iq3s \
   "https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/blob/main/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf"
 ```
 
-## Hugging Face repository
+Repository plus filename/pattern:
 
 ```bash
 llama-modelctl add qwen38-iq3s \
   ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF \
-  --file "Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf"
+  --file 'Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf'
 ```
 
-Wildcards are supported:
+Local file:
 
 ```bash
-llama-modelctl add my-model \
-  USER/REPO \
-  --file "*Q4_K_M*.gguf"
+llama-modelctl add my-model /path/to/model.gguf
 ```
 
-## Local GGUF
+New models default to automatic context fitting with a 4096-token minimum.
 
-```bash
-llama-modelctl add my-model \
-  /path/to/model.gguf
-```
+## Context control
 
-Models are installed under:
-
-```text
-/models-local/<model-name>/
-```
-
-The tool can automatically handle:
-
-- normal GGUF files
-- sharded GGUF models
-- `mmproj` files for multimodal models
-
----
-
-# Context control
-
-## Show current context configuration
-
-```bash
-llama-modelctl ctx qwen38-iq3s
-```
-
-## Automatic context
-
-```bash
-llama-modelctl ctx qwen38-iq3s auto
-```
-
-## Automatic context with minimum size
+Automatic context fitting:
 
 ```bash
 llama-modelctl ctx qwen38-iq3s auto --fit-ctx 16384
 ```
 
-## Fixed context
+Fixed context:
 
 ```bash
 llama-modelctl ctx qwen38-iq3s 65536
 ```
 
----
-
-# Advanced model parameters
-
-Any normal `llama-server` preset parameter can be changed with:
+Show current context mode:
 
 ```bash
-llama-modelctl set MODEL KEY VALUE
+llama-modelctl ctx qwen38-iq3s
 ```
 
-Examples:
-
-### Sampling
+## Advanced model parameters
 
 ```bash
-llama-modelctl set qwen38-iq3s temp 1.0
-llama-modelctl set qwen38-iq3s top-p 0.95
 llama-modelctl set qwen38-iq3s top-k 20
-llama-modelctl set qwen38-iq3s min-p 0.0
-```
-
-### KV cache
-
-Use F16:
-
-```bash
-llama-modelctl set qwen38-iq3s cache-type-k f16
-llama-modelctl set qwen38-iq3s cache-type-v f16
-```
-
-Use Q8:
-
-```bash
+llama-modelctl set qwen38-iq3s top-p 0.95
+llama-modelctl set qwen38-iq3s temp 1.0
 llama-modelctl set qwen38-iq3s cache-type-k q8_0
 llama-modelctl set qwen38-iq3s cache-type-v q8_0
 ```
 
-Use Q4:
-
-```bash
-llama-modelctl set qwen38-iq3s cache-type-k q4_0
-llama-modelctl set qwen38-iq3s cache-type-v q4_0
-```
-
-### Generation
-
-```bash
-llama-modelctl set qwen38-iq3s n-predict 8192
-```
-
-### Reasoning
-
-```bash
-llama-modelctl set qwen38-iq3s reasoning on
-llama-modelctl set qwen38-iq3s reasoning-effort medium
-```
-
-Remove a custom parameter:
+Remove a custom key:
 
 ```bash
 llama-modelctl unset qwen38-iq3s reasoning-effort
 ```
 
----
+Hardware-managed keys such as `device`, `n-gpu-layers`, `fit`, `fit-target`, `main-gpu`, and `split-mode` are protected from per-model edits.
 
-# Hardware-managed parameters
+## Remove models
 
-Some parameters are intentionally managed automatically and should not normally be configured per model:
-
-```text
-device
-main-gpu
-n-gpu-layers
-fit
-fit-target
-split-mode
-```
-
-These are selected at boot according to the available hardware.
-
-This avoids maintaining separate presets for:
-
-```text
-RTX 3060
-RTX 3090
-RTX 4090
-HX370 / Radeon 890M
-```
-
-The same model definitions can be reused across all of them.
-
----
-
-# Remove models
-
-Remove only the preset:
+Preset only:
 
 ```bash
 llama-modelctl remove qwen38-iq3s
 ```
 
-The GGUF files remain on disk.
-
-Remove the preset and downloaded model files:
+Preset and files under `/models-local`:
 
 ```bash
 llama-modelctl remove qwen38-iq3s --files
 ```
 
-For safety, file deletion is restricted to:
+## Update llama.cpp
 
-```text
-/models-local
-```
-
----
-
-# Update llama.cpp
-
-`llama-modelctl` can update and rebuild `llama.cpp` automatically:
+Build all supported GPU backends:
 
 ```bash
 llama-modelctl update
 ```
 
-This performs approximately:
+Select build backends explicitly:
 
-```text
-git pull --ff-only
-        ↓
-CMake configure
-        ↓
-CUDA
-ROCm / HIP
-Vulkan
-        ↓
-build-all
-        ↓
-llama-server --list-devices
-        ↓
-restart llama-main
+```bash
+llama-modelctl update --backends cuda
+llama-modelctl update --backends hip
+llama-modelctl update --backends vulkan
+llama-modelctl update --backends cuda,hip,vulkan
+llama-modelctl update --backends cpu
 ```
 
-The resulting binary is:
+The command performs a `git pull --ff-only`, reconfigures `~/llama.cpp/build-all`, rebuilds, runs `llama-server --list-devices`, and restarts `llama-main` unless `--no-restart` is supplied.
 
-```text
-~/llama.cpp/build-all/bin/llama-server
+## Export models for OpenCode
+
+OpenCode may run on another Linux, Windows, or macOS machine. This project does not try to modify that remote machine. Instead it prints or writes a ready-to-place OpenCode configuration.
+
+Print JSON to stdout:
+
+```bash
+llama-modelctl export-opencode \
+  --base-url http://192.168.1.50:8080/v1
 ```
 
-The build enables:
+Write a file:
 
-```text
-GGML_CUDA=ON
-GGML_HIP=ON
-GGML_VULKAN=ON
-GGML_BACKEND_DL=ON
+```bash
+llama-modelctl export-opencode \
+  --base-url http://192.168.1.50:8080/v1 \
+  --output opencode.jsonc
 ```
 
----
+Set a default model:
 
-# Configuration files
-
-Main llama.cpp preset:
-
-```text
-~/llama-models.ini
+```bash
+llama-modelctl export-opencode \
+  --base-url http://192.168.1.50:8080/v1 \
+  --default-model qwen38-27b-gsq-rco-iq3-s \
+  --output opencode.jsonc
 ```
 
-Model manager state:
+For models using automatic context fitting, the exporter uses the guaranteed `fit-ctx` minimum by default. Override the advertised OpenCode context if desired:
+
+```bash
+llama-modelctl export-opencode \
+  --base-url http://192.168.1.50:8080/v1 \
+  --auto-context 65536
+```
+
+Embedding/reranker presets are excluded. A model is exported with image input only when its configured `mmproj` exists.
+
+OpenCode global config is normally placed at:
+
+```text
+~/.config/opencode/opencode.jsonc
+```
+
+The generated provider uses OpenCode's OpenAI-compatible package and points at the remote `llama-server` `/v1` endpoint.
+
+## State file
+
+Runtime metadata is stored separately from `llama-models.ini`:
 
 ```text
 ~/.config/llama-modelctl/state.json
 ```
 
-The state file stores metadata such as whether a model uses:
+It stores context mode, backend policy, performance policy, and preferences that need to survive runtime hardware rewrites.
 
-```text
-fixed context
-```
+## Backups
 
-or:
+Commands that modify `~/llama-models.ini` create timestamped backups first.
 
-```text
-automatic context fitting
-```
-
-No custom unsupported keys need to be added to `llama-models.ini`.
-
----
-
-# Environment variables
-
-Default paths can be overridden:
-
-```text
-LLAMA_CPP_DIR
-LLAMA_SERVER
-LLAMA_MODELS_INI
-LLAMA_MODELS_DIR
-LLAMA_SERVICE
-LLAMA_MODELCTL_STATE
-```
-
-Example:
+## Uninstall
 
 ```bash
-export LLAMA_MODELS_DIR=/mnt/llm-models
+./uninstall.sh
 ```
 
----
+The uninstaller removes the tools and systemd integration. It does not delete models, `llama.cpp`, the INI file, or state data.
 
-# Backups
+## License
 
-Every command that changes:
-
-```text
-~/llama-models.ini
-```
-
-creates a timestamped backup first.
-
-Example:
-
-```text
-llama-models.ini.bak.20261005-153000
-```
-
----
-
-# Typical workflow
-
-Add a model:
-
-```bash
-llama-modelctl add qwen38-iq3s \
-  ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF \
-  --file "Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf"
-```
-
-Use automatic context fitting:
-
-```bash
-llama-modelctl ctx qwen38-iq3s auto --fit-ctx 16384
-```
-
-Use Q8 KV cache:
-
-```bash
-llama-modelctl set qwen38-iq3s cache-type-k q8_0
-llama-modelctl set qwen38-iq3s cache-type-v q8_0
-```
-
-Inspect:
-
-```bash
-llama-modelctl
+MIT

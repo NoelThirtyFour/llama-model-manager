@@ -8,6 +8,7 @@ SERVER = Path(os.environ.get('LLAMA_SERVER', str(HOME / 'llama.cpp/build-all/bin
 STATE = Path(os.environ.get('LLAMA_MODELCTL_STATE', str(HOME / '.config/llama-modelctl/state.json')))
 
 DYNAMIC_KEYS = {'device', 'fit-target', 'n-gpu-layers', 'main-gpu'}
+CACHE_KEYS = {'cache-type-k', 'cache-type-v'}
 
 
 def die(msg):
@@ -35,29 +36,60 @@ def parse_devices(text):
     return devices
 
 
-def pick_device(devices):
-    cuda = [d for d in devices if d['id'].startswith('CUDA')]
-    if cuda:
-        # Prefer the CUDA GPU with the most free VRAM. This handles 3060 -> 3090
-        # and multiple NVIDIA GPUs without hard-coding model names.
-        d = max(cuda, key=lambda x: x['free'])
-        free = d['free']
-        margin = 1024 if free < 16000 else 2048 if free < 28000 else 3072
-        return d['id'], margin
+def _margin_for(device, profile):
+    free=device.get('free',0)
+    is_nvidia='NVIDIA' in device.get('name','').upper() or device.get('id','').startswith('CUDA')
+    if device.get('id','').startswith('ROCm') or 'AMD' in device.get('name','').upper() or 'RADEON' in device.get('name','').upper():
+        return 4096 if profile=='capacity' else 8192
+    if is_nvidia:
+        if profile=='capacity':
+            return 512 if free < 16000 else 1024 if free < 28000 else 2048
+        if profile=='throughput':
+            return 768 if free < 16000 else 1536 if free < 28000 else 3072
+        return 1024 if free < 16000 else 2048 if free < 28000 else 3072
+    return 8192
 
-    rocm = [d for d in devices if d['id'].startswith('ROCm')]
-    if rocm:
-        d = max(rocm, key=lambda x: x['free'])
-        return d['id'], 8192
 
-    # Prefer NVIDIA Vulkan, then Vulkan with most free memory.
-    vk = [d for d in devices if d['id'].startswith('Vulkan')]
+def pick_device(devices, mode='auto', exact=None, profile='balanced'):
+    mode=('rocm' if mode=='hip' else mode).lower()
+    if exact:
+        for d in devices:
+            if d['id'].lower()==exact.lower():
+                return d, _margin_for(d, profile)
+        die(f'requested device not detected: {exact}')
+
+    if mode=='cpu':
+        return {'id':'none','name':'CPU','total':0,'free':0}, 0
+
+    def best(prefix, items=None):
+        c=items if items is not None else [d for d in devices if d['id'].startswith(prefix)]
+        if not c: return None
+        d=max(c,key=lambda x:x['free'])
+        return d,_margin_for(d,profile)
+
+    if mode=='cuda':
+        r=best('CUDA')
+        if not r: die('CUDA requested but no CUDA device detected')
+        return r
+    if mode=='rocm':
+        r=best('ROCm')
+        if not r: die('HIP/ROCm requested but no ROCm device detected')
+        return r
+    if mode=='vulkan':
+        r=best('Vulkan')
+        if not r: die('Vulkan requested but no Vulkan device detected')
+        return r
+    if mode!='auto':
+        die(f'unknown backend mode: {mode}')
+
+    r=best('CUDA')
+    if r: return r
+    r=best('ROCm')
+    if r: return r
+    vk=[d for d in devices if d['id'].startswith('Vulkan')]
     if vk:
-        nvidia = [d for d in vk if 'NVIDIA' in d['name'].upper()]
-        d = max(nvidia or vk, key=lambda x: x['free'])
-        margin = 1024 if 'NVIDIA' in d['name'].upper() and d['free'] < 16000 else 2048 if 'NVIDIA' in d['name'].upper() else 8192
-        return d['id'], margin
-
+        nvidia=[d for d in vk if 'NVIDIA' in d['name'].upper()]
+        return best('Vulkan', nvidia or vk)
     die('no CUDA/ROCm/Vulkan device detected')
 
 
@@ -107,8 +139,16 @@ def main():
     if p.returncode != 0:
         die('--list-devices failed')
 
-    device, fit_target = pick_device(parse_devices(p.stdout))
     state = load_state()
+    hw = state.setdefault('hardware', {})
+    backend_mode = hw.get('backend', 'auto')
+    exact_device = hw.get('device')
+    profile = hw.get('profile', 'balanced')
+    selected, fit_target = pick_device(parse_devices(p.stdout), backend_mode, exact_device, profile)
+    device = selected['id']
+    device_name = selected['name']
+    is_cpu = device == 'none'
+    is_amd = (not is_cpu) and (device.startswith('ROCm') or ('AMD' in device_name.upper()) or ('RADEON' in device_name.upper()))
 
     lines = INI.read_text(encoding='utf-8').splitlines(keepends=True)
     ranges = section_ranges(lines)
@@ -118,23 +158,57 @@ def main():
     replacements = {}
     for start, end, name in ranges:
         if name == '*':
-            replacements[start] = (end, update_section(
-                lines, start, end,
-                updates={
-                    'device': device,
-                    'split-mode': 'none',
-                    'main-gpu': '0',
-                    'n-gpu-layers': 'auto',
-                    'fit': 'on',
-                    'fit-target': str(fit_target),
-                },
-            ))
+            if is_cpu:
+                updates={'device':'none','split-mode':'none','main-gpu':'0','n-gpu-layers':'0','fit':'off'}
+                remove={'fit-target'}
+            else:
+                updates={'device':device,'split-mode':'none','main-gpu':'0','n-gpu-layers':'auto','fit':'on','fit-target':str(fit_target)}
+                remove=set()
+            replacements[start] = (end, update_section(lines, start, end, updates=updates, remove=remove))
             continue
 
         # Force model sections to inherit dynamic GPU settings.
         remove = set(DYNAMIC_KEYS)
         updates = {}
-        model_state = state.get('models', {}).get(name, {})
+        model_state = state.setdefault('models', {}).setdefault(name, {})
+
+        # Preserve per-model KV preference separately from the runtime INI.
+        # HX370/AMD runs F16/F16 for stability/performance. CUDA restores the
+        # user's preferred cache types (q8_0/q4_0/f16/etc.) automatically.
+        sec_text = ''.join(lines[start:end])
+        current = {}
+        for ln in sec_text.splitlines()[1:]:
+            km = re.match(r'^\s*([A-Za-z0-9_-]+)\s*=\s*(.*?)\s*$', ln)
+            if km:
+                current[km.group(1).lower()] = km.group(2)
+
+        pref = model_state.setdefault('cache_pref', {})
+        for ck in CACHE_KEYS:
+            if ck in current and current[ck].lower() != 'f16' and ck not in pref:
+                pref[ck] = current[ck]
+
+        perf_pref = model_state.setdefault('perf_pref', {})
+        for pk in ('batch-size','ubatch-size'):
+            if pk in current and pk not in perf_pref:
+                perf_pref[pk] = current[pk]
+        if profile == 'throughput' and (device.startswith('CUDA') or ('NVIDIA' in device_name.upper() and device.startswith('Vulkan'))):
+            updates['batch-size'] = '128'
+            updates['ubatch-size'] = '128'
+        else:
+            for pk in ('batch-size','ubatch-size'):
+                if pk in perf_pref:
+                    updates[pk] = perf_pref[pk]
+
+        if is_amd:
+            updates['cache-type-k'] = 'f16'
+            updates['cache-type-v'] = 'f16'
+        else:
+            # Restore stored preference when leaving AMD runtime. If there is
+            # no explicit preference, retain the current/default value.
+            for ck in CACHE_KEYS:
+                if ck in pref:
+                    updates[ck] = pref[ck]
+
         mode = model_state.get('ctx_mode')
         if mode == 'auto':
             remove.add('ctx-size')
@@ -160,7 +234,15 @@ def main():
     tmp.write_text(''.join(out), encoding='utf-8')
     os.replace(tmp, INI)
 
-    print(f'[llama-hw-select] device={device} fit-target={fit_target} MiB n-gpu-layers=auto')
+    # Persist cache preferences discovered during runtime rewrite.
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    stmp = STATE.with_suffix('.tmp')
+    stmp.write_text(json.dumps(state, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    os.replace(stmp, STATE)
+
+    kv_mode = 'F16/F16 forced' if is_amd else 'per-model preference'
+    ngl = '0' if is_cpu else 'auto'
+    print(f'[llama-hw-select] backend={backend_mode} profile={profile} device={device} ({device_name}) fit-target={fit_target} MiB n-gpu-layers={ngl} KV={kv_mode}')
 
 if __name__ == '__main__':
     main()
