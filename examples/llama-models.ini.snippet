@@ -1,0 +1,16 @@
+version = 1
+
+[*]
+models-max = 1
+load-on-startup = false
+# device / fit-target / n-gpu-layers are maintained automatically at boot
+
+[example-model]
+model = /models-local/example-model/model.gguf
+alias = example-model
+# For auto context, do not set ctx-size manually; use:
+#   llama-modelctl ctx example-model auto --fit-ctx 4096
+cache-type-k = f16
+cache-type-v = f16
+flash-attn = on
+jinja = true

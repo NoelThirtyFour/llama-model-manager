@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+import json, os, re, subprocess, sys
+from pathlib import Path
+
+HOME = Path(os.environ.get('LLAMA_HOME', str(Path.home())))
+INI = Path(os.environ.get('LLAMA_MODELS_INI', str(HOME / 'llama-models.ini')))
+SERVER = Path(os.environ.get('LLAMA_SERVER', str(HOME / 'llama.cpp/build-all/bin/llama-server')))
+STATE = Path(os.environ.get('LLAMA_MODELCTL_STATE', str(HOME / '.config/llama-modelctl/state.json')))
+
+DYNAMIC_KEYS = {'device', 'fit-target', 'n-gpu-layers', 'main-gpu'}
+
+
+def die(msg):
+    print(f'[llama-hw-select] ERROR: {msg}', file=sys.stderr)
+    raise SystemExit(1)
+
+
+def load_state():
+    if not STATE.exists():
+        return {'models': {}}
+    try:
+        return json.loads(STATE.read_text(encoding='utf-8'))
+    except Exception as e:
+        die(f'invalid state file {STATE}: {e}')
+
+
+def parse_devices(text):
+    devices = []
+    rx = re.compile(r'^\s*(\w+\d+):\s*(.*?)\s*\((\d+) MiB,\s*(\d+) MiB free\)\s*$', re.M)
+    for m in rx.finditer(text):
+        devices.append({
+            'id': m.group(1), 'name': m.group(2),
+            'total': int(m.group(3)), 'free': int(m.group(4)),
+        })
+    return devices
+
+
+def pick_device(devices):
+    cuda = [d for d in devices if d['id'].startswith('CUDA')]
+    if cuda:
+        # Prefer the CUDA GPU with the most free VRAM. This handles 3060 -> 3090
+        # and multiple NVIDIA GPUs without hard-coding model names.
+        d = max(cuda, key=lambda x: x['free'])
+        free = d['free']
+        margin = 1024 if free < 16000 else 2048 if free < 28000 else 3072
+        return d['id'], margin
+
+    rocm = [d for d in devices if d['id'].startswith('ROCm')]
+    if rocm:
+        d = max(rocm, key=lambda x: x['free'])
+        return d['id'], 8192
+
+    # Prefer NVIDIA Vulkan, then Vulkan with most free memory.
+    vk = [d for d in devices if d['id'].startswith('Vulkan')]
+    if vk:
+        nvidia = [d for d in vk if 'NVIDIA' in d['name'].upper()]
+        d = max(nvidia or vk, key=lambda x: x['free'])
+        margin = 1024 if 'NVIDIA' in d['name'].upper() and d['free'] < 16000 else 2048 if 'NVIDIA' in d['name'].upper() else 8192
+        return d['id'], margin
+
+    die('no CUDA/ROCm/Vulkan device detected')
+
+
+def section_ranges(lines):
+    starts = []
+    for i, line in enumerate(lines):
+        m = re.match(r'^\s*\[([^]]+)\]\s*$', line)
+        if m:
+            starts.append((i, m.group(1)))
+    out = []
+    for n, (start, name) in enumerate(starts):
+        end = starts[n+1][0] if n+1 < len(starts) else len(lines)
+        out.append((start, end, name))
+    return out
+
+
+def update_section(lines, start, end, updates=None, remove=None):
+    updates = dict(updates or {})
+    remove = set(remove or set())
+    body = [lines[start]]
+    seen = set()
+    for line in lines[start+1:end]:
+        m = re.match(r'^\s*([A-Za-z0-9_-]+)\s*=.*$', line)
+        if m:
+            key = m.group(1).lower()
+            if key in remove:
+                continue
+            if key in updates:
+                body.append(f'{key} = {updates[key]}\n')
+                seen.add(key)
+                continue
+        body.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            body.append(f'{key} = {value}\n')
+    return body
+
+
+def main():
+    if not SERVER.exists():
+        die(f'llama-server not found: {SERVER}')
+    if not INI.exists():
+        die(f'INI not found: {INI}')
+
+    p = subprocess.run([str(SERVER), '--list-devices'], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    print(p.stdout, end='')
+    if p.returncode != 0:
+        die('--list-devices failed')
+
+    device, fit_target = pick_device(parse_devices(p.stdout))
+    state = load_state()
+
+    lines = INI.read_text(encoding='utf-8').splitlines(keepends=True)
+    ranges = section_ranges(lines)
+    if not any(name == '*' for _, _, name in ranges):
+        die('missing [*] global section')
+
+    replacements = {}
+    for start, end, name in ranges:
+        if name == '*':
+            replacements[start] = (end, update_section(
+                lines, start, end,
+                updates={
+                    'device': device,
+                    'split-mode': 'none',
+                    'main-gpu': '0',
+                    'n-gpu-layers': 'auto',
+                    'fit': 'on',
+                    'fit-target': str(fit_target),
+                },
+            ))
+            continue
+
+        # Force model sections to inherit dynamic GPU settings.
+        remove = set(DYNAMIC_KEYS)
+        updates = {}
+        model_state = state.get('models', {}).get(name, {})
+        mode = model_state.get('ctx_mode')
+        if mode == 'auto':
+            remove.add('ctx-size')
+            updates['fit-ctx'] = str(int(model_state.get('fit_ctx', 4096)))
+        elif mode == 'fixed':
+            remove.add('fit-ctx')
+            updates['ctx-size'] = str(int(model_state['ctx_size']))
+
+        replacements[start] = (end, update_section(lines, start, end, updates=updates, remove=remove))
+
+    out = []
+    i = 0
+    while i < len(lines):
+        if i in replacements:
+            end, new = replacements[i]
+            out.extend(new)
+            i = end
+        else:
+            out.append(lines[i])
+            i += 1
+
+    tmp = INI.with_suffix(INI.suffix + '.tmp')
+    tmp.write_text(''.join(out), encoding='utf-8')
+    os.replace(tmp, INI)
+
+    print(f'[llama-hw-select] device={device} fit-target={fit_target} MiB n-gpu-layers=auto')
+
+if __name__ == '__main__':
+    main()

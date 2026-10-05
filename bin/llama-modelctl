@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+import argparse, datetime, fnmatch, json, os, re, shutil, subprocess, sys
+from pathlib import Path
+from urllib.parse import urlparse, unquote
+
+HOME = Path(os.environ.get('LLAMA_HOME', str(Path.home())))
+INI = Path(os.environ.get('LLAMA_MODELS_INI', str(HOME / 'llama-models.ini')))
+MODELS_DIR = Path(os.environ.get('LLAMA_MODELS_DIR', '/models-local'))
+REPO = Path(os.environ.get('LLAMA_CPP_DIR', str(HOME / 'llama.cpp')))
+BUILD = REPO / 'build-all'
+SERVER = BUILD / 'bin/llama-server'
+STATE = Path(os.environ.get('LLAMA_MODELCTL_STATE', str(HOME / '.config/llama-modelctl/state.json')))
+SERVICE = os.environ.get('LLAMA_SERVICE', 'llama-main')
+
+PROTECTED = {'device','fit-target','n-gpu-layers','main-gpu','split-mode','fit'}
+CACHE_KEYS = {'cache-type-k','cache-type-v','cache-type-k-draft','cache-type-v-draft'}
+CACHE_TYPES = {'f32','f16','bf16','q8_0','q5_0','q5_1','q4_0','q4_1','iq4_nl'}
+
+
+def die(msg):
+    print(f'ERROR: {msg}', file=sys.stderr); raise SystemExit(1)
+
+def run(cmd, *, capture=False, check=True, cwd=None):
+    print('+', ' '.join(map(str, cmd)))
+    return subprocess.run(list(map(str, cmd)), text=True, cwd=cwd,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.STDOUT if capture else None, check=check)
+
+def load_state():
+    if not STATE.exists(): return {'models': {}}
+    try: return json.loads(STATE.read_text(encoding='utf-8'))
+    except Exception as e: die(f'invalid state {STATE}: {e}')
+
+def save_state(st):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix('.tmp')
+    tmp.write_text(json.dumps(st, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    os.replace(tmp, STATE)
+
+def backup_ini():
+    if not INI.exists(): die(f'{INI} not found')
+    ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    dst = INI.with_name(INI.name + '.bak.' + ts)
+    shutil.copy2(INI, dst); print('Backup:', dst)
+
+def read_ini():
+    if not INI.exists(): die(f'{INI} not found')
+    return INI.read_text(encoding='utf-8')
+
+def section_re(name): return re.compile(rf'(?ms)^\[{re.escape(name)}\]\s*\n.*?(?=^\[|\Z)')
+def get_section(txt, name):
+    m=section_re(name).search(txt); return m.group(0).rstrip() if m else None
+
+def set_section(txt, name, block):
+    txt=section_re(name).sub('',txt).rstrip(); return txt+'\n\n'+block.strip()+'\n'
+def remove_section(txt, name): return section_re(name).sub('',txt).rstrip()+'\n'
+def values(sec):
+    d={}
+    for line in sec.splitlines()[1:]:
+        m=re.match(r'^\s*([A-Za-z0-9_-]+)\s*=\s*(.*?)\s*$',line)
+        if m: d[m.group(1).lower()]=m.group(2)
+    return d
+
+def set_key(txt,name,key,val):
+    sec=get_section(txt,name)
+    if not sec: die(f'profile not found: {name}')
+    out=[sec.splitlines()[0]]; done=False
+    for line in sec.splitlines()[1:]:
+        m=re.match(r'^\s*([A-Za-z0-9_-]+)\s*=',line)
+        if m and m.group(1).lower()==key.lower(): out.append(f'{key} = {val}'); done=True
+        else: out.append(line)
+    if not done: out.append(f'{key} = {val}')
+    return section_re(name).sub('\n'.join(out)+'\n',txt)
+def unset_key(txt,name,key):
+    sec=get_section(txt,name)
+    if not sec: die(f'profile not found: {name}')
+    out=[]
+    for line in sec.splitlines():
+        m=re.match(r'^\s*([A-Za-z0-9_-]+)\s*=',line)
+        if m and m.group(1).lower()==key.lower(): continue
+        out.append(line)
+    return section_re(name).sub('\n'.join(out)+'\n',txt)
+
+def restart():
+    u=subprocess.run(['systemctl','--user','cat',SERVICE+'.service'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    if u.returncode==0:
+        run(['systemctl','--user','restart',SERVICE]); return
+    s=subprocess.run(['systemctl','cat',SERVICE+'.service'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    if s.returncode==0:
+        run(['sudo','systemctl','restart',SERVICE]); return
+    print(f'WARNING: {SERVICE} not found; restart skipped', file=sys.stderr)
+
+def parse_hf(src):
+    if src.startswith('hf://'):
+        p=src[5:].split('/',2)
+        if len(p)<2: die('invalid hf:// URL')
+        return '/'.join(p[:2]), 'main', p[2] if len(p)>2 else None
+    if src.startswith('http://') or src.startswith('https://'):
+        u=urlparse(src)
+        if u.netloc not in {'huggingface.co','www.huggingface.co'}: return None
+        p=[unquote(x) for x in u.path.strip('/').split('/')]
+        if len(p)<2: die('invalid Hugging Face URL')
+        repo=f'{p[0]}/{p[1]}'
+        if len(p)>=5 and p[2] in {'blob','resolve'}: return repo,p[3],'/'.join(p[4:])
+        return repo,'main',None
+    if re.match(r'^[^/\s]+/[^/\s]+$',src): return src,'main',None
+    return None
+
+def hf_files(repo, rev):
+    try:
+        from huggingface_hub import HfApi
+    except ImportError: die('install huggingface_hub: python3 -m pip install --user -U huggingface_hub')
+    try: return HfApi().list_repo_files(repo_id=repo, revision=rev)
+    except Exception as e: die(f'cannot list {repo}@{rev}: {e}')
+def choose(files, wanted):
+    c=[f for f in files if f.lower().endswith('.gguf') and 'mmproj' not in f.lower()]
+    if wanted:
+        m=[f for f in c if f==wanted or fnmatch.fnmatch(f,wanted)]
+        if len(m)==1: return m[0]
+        if len(m)>1: die('multiple GGUF matches; use a more precise --file')
+        die(f'GGUF not found: {wanted}')
+    if len(c)==1: return c[0]
+    print('\n'.join(c[:80])); die('repo contains multiple GGUF files; use --file')
+def shards(files, f):
+    m=re.match(r'^(.*)-(\d{5})-of-(\d{5})\.gguf$',f)
+    if not m: return [f]
+    rx=re.compile(rf'^{re.escape(m.group(1))}-\d{{5}}-of-{m.group(3)}\.gguf$')
+    return sorted(x for x in files if rx.match(x)) or [f]
+def mmproj(files):
+    c=[f for f in files if f.lower().endswith('.gguf') and 'mmproj' in f.lower()]
+    if not c: return None
+    def rank(x):
+        l=x.lower(); return (0 if 'q8_0' in l else 1 if 'bf16' in l else 2 if 'f16' in l else 9, x)
+    return sorted(c,key=rank)[0]
+def hf_download(repo, rev, files, dst):
+    if not shutil.which('hf'): die("'hf' command missing; install huggingface_hub")
+    run(['hf','download',repo,*files,'--revision',rev,'--local-dir',dst])
+
+def default_block(name, model, mm=None):
+    low=(name+' '+model.name).lower()
+    b=[f'[{name}]',f'model = {model}',f'alias = {name}']
+    if mm: b.append(f'mmproj = {mm}')
+    b += ['', 'parallel = 1','batch-size = 512','ubatch-size = 256','','jinja = true','cont-batching = true','flash-attn = on','','cache-type-k = f16','cache-type-v = f16','']
+    if 'qwen3.8' in low or 'qwen38' in low:
+        b += ['reasoning = off','reasoning-preserve = false','spec-type = none','','temp = 0.7','top-p = 0.8','top-k = 20','min-p = 0.0','presence-penalty = 1.5','repeat-penalty = 1.0']
+    else: b += ['reasoning = off','spec-type = none']
+    b += ['','n-predict = 8192','load-on-startup = false']
+    return '\n'.join(b)
+
+def cmd_list(a):
+    txt=read_ini()
+    for n in re.findall(r'(?m)^\[([^]]+)\]\s*$',txt):
+        if n=='*': continue
+        v=values(get_section(txt,n)); st=load_state().get('models',{}).get(n,{})
+        cm=st.get('ctx_mode','legacy'); cv=st.get('ctx_size',st.get('fit_ctx',''))
+        print(f'{n:45} ctx={cm}:{cv}  {v.get("model","")}')
+def cmd_show(a):
+    s=get_section(read_ini(),a.name)
+    if not s: die('profile not found')
+    print(s); print('\n--- modelctl state ---'); print(json.dumps(load_state().get('models',{}).get(a.name,{}),indent=2))
+def cmd_add(a):
+    MODELS_DIR.mkdir(parents=True,exist_ok=True)
+    if not os.access(MODELS_DIR,os.W_OK): die(f'{MODELS_DIR} not writable; sudo chown $USER:$USER {MODELS_DIR}')
+    src=Path(os.path.expanduser(a.source)); mm=None
+    if src.is_file():
+        dst=MODELS_DIR/a.name; dst.mkdir(parents=True,exist_ok=True); model=dst/src.name
+        if src.resolve()!=model.resolve(): shutil.copy2(src,model)
+        if a.mmproj:
+            mp=Path(os.path.expanduser(a.mmproj));
+            if not mp.is_file(): die('mmproj not found')
+            mm=dst/mp.name
+            if mp.resolve()!=mm.resolve(): shutil.copy2(mp,mm)
+    else:
+        p=parse_hf(a.source)
+        if not p: die('source must be a local GGUF, HF URL or USER/REPO')
+        repo,rev,wanted=p
+        if a.revision: rev=a.revision
+        fs=hf_files(repo,rev); f=choose(fs,a.file or wanted); dl=shards(fs,f); mp=None if a.no_mmproj else mmproj(fs)
+        if mp and mp not in dl: dl.append(mp)
+        dst=MODELS_DIR/a.name; dst.mkdir(parents=True,exist_ok=True); hf_download(repo,rev,dl,dst)
+        model=next((dst/x for x in sorted(dl) if '-00001-of-' in x), dst/f)
+        mm=dst/mp if mp else None
+    if not model.exists(): die(f'model missing after install: {model}')
+    backup_ini(); txt=set_section(read_ini(),a.name,default_block(a.name,model,mm)); INI.write_text(txt,encoding='utf-8')
+    st=load_state(); ms=st.setdefault('models',{}).setdefault(a.name,{})
+    if a.ctx=='auto': ms.update({'ctx_mode':'auto','fit_ctx':a.fit_ctx}); ms.pop('ctx_size',None)
+    else: ms.update({'ctx_mode':'fixed','ctx_size':int(a.ctx)}); ms.pop('fit_ctx',None); txt=set_key(read_ini(),a.name,'ctx-size',str(int(a.ctx))); INI.write_text(txt,encoding='utf-8')
+    save_state(st)
+    run([str(Path('/usr/local/bin/llama-hw-select'))], check=False)
+    if not a.no_restart: restart()
+def cmd_remove(a):
+    txt=read_ini(); sec=get_section(txt,a.name)
+    if not sec: die('profile not found')
+    v=values(sec); backup_ini(); INI.write_text(remove_section(txt,a.name),encoding='utf-8')
+    st=load_state(); st.setdefault('models',{}).pop(a.name,None); save_state(st)
+    if a.files:
+        p=Path(v.get('model',''))
+        try: root=p.parent.resolve(); root.relative_to(MODELS_DIR.resolve())
+        except Exception: root=None
+        if root and root.is_dir(): shutil.rmtree(root); print('Removed:',root)
+    if not a.no_restart: restart()
+def cmd_ctx(a):
+    txt=read_ini();
+    if not get_section(txt,a.name): die('profile not found')
+    st=load_state(); ms=st.setdefault('models',{}).setdefault(a.name,{})
+    if a.value is None:
+        print(json.dumps(ms or {'ctx_mode':'legacy'},indent=2)); return
+    backup_ini()
+    if a.value=='auto':
+        ms={'ctx_mode':'auto','fit_ctx':a.fit_ctx}; st['models'][a.name]=ms
+        txt=unset_key(txt,a.name,'ctx-size'); txt=set_key(txt,a.name,'fit-ctx',str(a.fit_ctx))
+    else:
+        try: n=int(a.value)
+        except: die('ctx must be integer or auto')
+        if n<=0: die('ctx must be > 0')
+        ms={'ctx_mode':'fixed','ctx_size':n}; st['models'][a.name]=ms
+        txt=unset_key(txt,a.name,'fit-ctx'); txt=set_key(txt,a.name,'ctx-size',str(n))
+    INI.write_text(txt,encoding='utf-8'); save_state(st)
+    if not a.no_restart: restart()
+def cmd_set(a):
+    if a.key.lower() in PROTECTED: die(f'{a.key} is boot-managed; use hardware auto-selection')
+    if a.key.lower() in CACHE_KEYS and a.value.lower() not in CACHE_TYPES: print('WARNING: unusual cache type',file=sys.stderr)
+    backup_ini(); INI.write_text(set_key(read_ini(),a.name,a.key,a.value),encoding='utf-8')
+    if not a.no_restart: restart()
+def cmd_unset(a):
+    if a.key.lower() in {'model','alias'}: die('refusing to remove required key')
+    backup_ini(); INI.write_text(unset_key(read_ini(),a.name,a.key),encoding='utf-8')
+    if not a.no_restart: restart()
+def cmd_devices(a): run([str(SERVER),'--list-devices'])
+def cmd_update(a):
+    if not (REPO/'.git').exists(): die(f'{REPO} is not a git repo')
+    run(['git','-C',REPO,'pull','--ff-only'])
+    args=['cmake','-S',REPO,'-B',BUILD,'-G','Ninja','-DCMAKE_BUILD_TYPE=Release','-DGGML_BACKEND_DL=ON','-DGGML_CUDA=ON','-DGGML_HIP=ON','-DGGML_VULKAN=ON','-DGGML_NATIVE=OFF']
+    run(args); run(['cmake','--build',BUILD,'-j',str(os.cpu_count() or 4)])
+    run([str(SERVER),'--list-devices'])
+    if not a.no_restart: restart()
+
+def main():
+    p=argparse.ArgumentParser(prog='llama-modelctl'); sp=p.add_subparsers(dest='cmd',required=True)
+    q=sp.add_parser('list'); q.set_defaults(func=cmd_list)
+    q=sp.add_parser('show'); q.add_argument('name'); q.set_defaults(func=cmd_show)
+    q=sp.add_parser('devices'); q.set_defaults(func=cmd_devices)
+    q=sp.add_parser('add'); q.add_argument('name'); q.add_argument('source'); q.add_argument('--file'); q.add_argument('--revision'); q.add_argument('--mmproj'); q.add_argument('--no-mmproj',action='store_true'); q.add_argument('--ctx',default='auto'); q.add_argument('--fit-ctx',type=int,default=4096); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_add)
+    q=sp.add_parser('remove'); q.add_argument('name'); q.add_argument('--files',action='store_true'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_remove)
+    q=sp.add_parser('ctx'); q.add_argument('name'); q.add_argument('value',nargs='?'); q.add_argument('--fit-ctx',type=int,default=4096); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_ctx)
+    q=sp.add_parser('set'); q.add_argument('name'); q.add_argument('key'); q.add_argument('value'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_set)
+    q=sp.add_parser('unset'); q.add_argument('name'); q.add_argument('key'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_unset)
+    q=sp.add_parser('update'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_update)
+    a=p.parse_args(); a.func(a)
+if __name__=='__main__': main()
