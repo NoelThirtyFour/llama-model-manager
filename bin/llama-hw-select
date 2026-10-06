@@ -191,7 +191,17 @@ def main():
         for pk in ('batch-size','ubatch-size'):
             if pk in current and pk not in perf_pref:
                 perf_pref[pk] = current[pk]
-        if profile == 'throughput' and (device.startswith('CUDA') or ('NVIDIA' in device_name.upper() and device.startswith('Vulkan'))):
+
+        backend_key = 'rocm' if device.startswith('ROCm') else 'cuda' if device.startswith('CUDA') else 'vulkan' if device.startswith('Vulkan') else 'cpu'
+        tuned = model_state.get('tuning',{}).get(f'{backend_key}:{device}',{}).get(profile,{}).get('best',{})
+        if tuned:
+            updates['batch-size'] = str(tuned.get('batch', perf_pref.get('batch-size','512')))
+            updates['ubatch-size'] = str(tuned.get('ubatch', perf_pref.get('ubatch-size','256')))
+            if not is_amd:
+                if tuned.get('ctk'): updates['cache-type-k'] = str(tuned['ctk'])
+                if tuned.get('ctv'): updates['cache-type-v'] = str(tuned['ctv'])
+            if tuned.get('fa'): updates['flash-attn'] = str(tuned['fa'])
+        elif profile == 'throughput' and (device.startswith('CUDA') or ('NVIDIA' in device_name.upper() and device.startswith('Vulkan'))):
             updates['batch-size'] = '128'
             updates['ubatch-size'] = '128'
         else:

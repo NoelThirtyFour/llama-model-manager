@@ -2,7 +2,13 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 SERVICE="${LLAMA_SERVICE:-llama-main}"
-HOME_DIR="${HOME}"
+if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+  TARGET_USER="$SUDO_USER"
+  HOME_DIR="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+else
+  TARGET_USER="$(id -un)"
+  HOME_DIR="$HOME"
+fi
 INI="${LLAMA_MODELS_INI:-$HOME_DIR/llama-models.ini}"
 SERVER="${LLAMA_SERVER:-$HOME_DIR/llama.cpp/build-all/bin/llama-server}"
 
@@ -12,12 +18,12 @@ SERVER="${LLAMA_SERVER:-$HOME_DIR/llama.cpp/build-all/bin/llama-server}"
 sudo install -m 0755 "$ROOT/bin/llama-modelctl" /usr/local/bin/llama-modelctl
 sudo install -m 0755 "$ROOT/bin/llama-hw-select" /usr/local/bin/llama-hw-select
 sudo mkdir -p /models-local
-sudo chown "$USER:$USER" /models-local
-mkdir -p "$HOME/.config/llama-modelctl"
+sudo chown "$TARGET_USER:$TARGET_USER" /models-local
+mkdir -p "$HOME_DIR/.config/llama-modelctl"
 
 if systemctl --user cat "$SERVICE.service" >/dev/null 2>&1; then
-  mkdir -p "$HOME/.config/systemd/user/$SERVICE.service.d"
-  cat > "$HOME/.config/systemd/user/$SERVICE.service.d/10-auto-hardware.conf" <<EOF
+  mkdir -p "$HOME_DIR/.config/systemd/user/$SERVICE.service.d"
+  cat > "$HOME_DIR/.config/systemd/user/$SERVICE.service.d/10-auto-hardware.conf" <<EOF
 [Service]
 Environment=LLAMA_HOME=$HOME_DIR
 Environment=LLAMA_MODELS_INI=$INI

@@ -7,4 +7,4 @@ check:
 	python3 -m py_compile bin/llama-modelctl bin/llama-hw-select
 	bash -n install.sh uninstall.sh tests/smoke.sh
 test: check
-	./tests/smoke.sh
+	bash tests/smoke.sh

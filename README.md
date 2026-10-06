@@ -311,6 +311,70 @@ Commands that modify `~/llama-models.ini` create timestamped backups first.
 
 The uninstaller removes the tools and systemd integration. It does not delete models, `llama.cpp`, the INI file, or state data.
 
+## Adaptive tuning
+
+`llama-modelctl` can benchmark a model for a short, bounded period and keep the best measured settings for the current hardware.
+
+```bash
+llama-modelctl tune qwen38-iq3s
+llama-modelctl tune qwen38-iq3s --goal throughput --apply
+llama-modelctl tune deepseek-v4-flash-iq2 --minutes 10 --goal balanced --apply
+```
+
+If `--minutes` is omitted, the budget adapts to GGUF size:
+
+| GGUF size | Default budget |
+| --- | ---: |
+| under 8 GiB | ~2 min |
+| 8-20 GiB | ~4 min |
+| 20-60 GiB | ~6 min |
+| over 60 GiB | ~10 min |
+
+The tuner measures only settings for which a speed benchmark is meaningful:
+
+- batch size / micro-batch size
+- KV cache format
+- Flash Attention
+- GPU memory fitting on the selected backend
+
+Results are stored separately for each backend/device and goal. A result measured on `CUDA0` is therefore not reused as an HX370/ROCm result. When a matching result exists, the boot selector can reuse it automatically.
+
+On AMD/HX370, the runtime KV policy remains **F16/F16** even if a CUDA tuning result prefers Q8 or Q4.
+
+> `llama-bench` does not measure answer quality. The tuner deliberately does not optimize temperature, top-k, top-p, penalties, or other sampling parameters.
+
+## Sampling presets
+
+Sampling is managed separately from performance tuning:
+
+```bash
+llama-modelctl sampling qwen38-iq3s show
+llama-modelctl sampling qwen38-iq3s hf
+llama-modelctl sampling qwen38-iq3s coding-agent
+llama-modelctl sampling qwen38-iq3s general-agent
+llama-modelctl sampling qwen38-iq3s precise
+llama-modelctl sampling qwen38-iq3s creative
+```
+
+`hf` is preferred when the model author publishes explicit defaults. For models installed from Hugging Face, the repo/revision is remembered automatically. The command first looks for a machine-readable `generation_config.json`, then for explicit sampling values in the model card.
+
+For an older/local model whose Hugging Face source is not known:
+
+```bash
+llama-modelctl sampling my-model hf --repo USER/REPO
+```
+
+Built-in presets are fallbacks, not claims about the ideal settings for every model:
+
+| Preset | Typical use |
+| --- | --- |
+| `coding-agent` | deterministic coding/tool agents |
+| `general-agent` | general assistant/tool use |
+| `precise` | low-variance factual/structured output |
+| `creative` | prose, brainstorming, poems |
+
+Changing a sampling preset edits only the sampling keys in that model section. It does not alter GPU/backend, context mode, KV policy, or tuning results.
+
 ## License
 
 MIT

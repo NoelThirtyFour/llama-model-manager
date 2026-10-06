@@ -1,30 +1,24 @@
 # Changelog
 
+## 0.4.0
+
+- Add `llama-modelctl tune MODEL` with an adaptive time budget based on GGUF size.
+- Tune measurable performance parameters only: batch/ubatch, KV cache, Flash Attention and memory fitting.
+- Store tuning results per backend/device and goal (`balanced`, `throughput`, `capacity`).
+- Re-apply a matching measured tuning profile automatically at boot when available.
+- Keep the HX370/ROCm policy of F16/F16 KV regardless of CUDA tuning results.
+- Add `llama-modelctl sampling MODEL PRESET` with `hf`, `coding-agent`, `general-agent`, `creative`, and `precise` presets.
+- `sampling ... hf` first tries `generation_config.json`, then explicit values in the Hugging Face README/model card.
+- Remember Hugging Face repo/revision/file metadata for models added from HF.
+- Keep sampling and performance tuning separate: speed benchmarks never guess which sampling values produce better answers.
+- Fix installer home detection when accidentally invoked through `sudo ./install.sh`.
+- Make `make test` invoke the smoke test through Bash so a Windows checkout cannot break it by dropping the executable bit.
+
 ## 0.3.0
 
-- Add runtime backend policy: `auto`, `cuda`, `hip`/`rocm`, `vulkan`, and `cpu`.
-- Add exact runtime device pinning such as `--device CUDA1` or `Vulkan1`.
-- Add `balanced`, `throughput`, and `capacity` runtime policies.
-- Preserve/restore per-model batch preferences when using the experimental throughput policy.
-- Add `llama-modelctl update --backends ...` to choose CUDA, HIP/ROCm, Vulkan, or CPU-only builds.
-- Add `export-opencode` with `--base-url`, `--output`, `--default-model`, and `--auto-context`.
-- Exclude embedding/reranker presets from OpenCode exports and only advertise vision when the `mmproj` exists.
-- Keep HX370/AMD F16/F16 KV enforcement with automatic NVIDIA cache preference restoration.
-
-## 0.2.0
-
-- Preserve per-model KV cache preferences separately from runtime hardware overrides.
-- Force `cache-type-k = f16` and `cache-type-v = f16` on AMD/HX370 runtime.
-- Restore the user's preferred Q8/Q4/F16 KV cache automatically when CUDA/NVIDIA is selected again.
-- Keep `n-gpu-layers = auto` and `fit = on` for dynamic 3060/3090/HX370 fitting.
-- Validate fixed and auto-fit context behavior.
-
-## 0.1.0
-
-- Automatic CUDA -> ROCm -> Vulkan device selection at service start.
-- Multi-CUDA selection by free VRAM.
-- llama.cpp auto offload with `n-gpu-layers=auto` and `fit=on`.
-- Fixed or auto-fit per-model context management.
-- Hugging Face/local GGUF add, remove, show, list and advanced set/unset.
-- Automatic mmproj/shard handling.
-- `llama-modelctl update` for CUDA + HIP/ROCm + Vulkan `build-all` rebuilds.
+- Add backend policy selection: `auto`, `cuda`, `hip`/`rocm`, `vulkan`, `cpu`.
+- Add exact device pinning (`--device CUDA1`, `Vulkan1`, ...).
+- Add performance profiles: `balanced`, `throughput`, `capacity`.
+- Add selective llama.cpp rebuild backends via `update --backends`.
+- Add OpenCode JSON export.
+- Preserve KV preferences across AMD/HX370 F16 runtime overrides.

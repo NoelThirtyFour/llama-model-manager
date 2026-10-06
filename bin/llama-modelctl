@@ -17,6 +17,13 @@ CACHE_KEYS = {'cache-type-k','cache-type-v','cache-type-k-draft','cache-type-v-d
 CACHE_TYPES = {'f32','f16','bf16','q8_0','q5_0','q5_1','q4_0','q4_1','iq4_nl'}
 BACKEND_MODES = {'auto','cuda','hip','rocm','vulkan','cpu'}
 PERF_PROFILES = {'balanced','throughput','capacity'}
+SAMPLING_PRESETS = {
+    'precise': {'temp':'0.2','top-p':'0.9','top-k':'20','min-p':'0.0','presence-penalty':'0.0','repeat-penalty':'1.0'},
+    'coding-agent': {'temp':'0.3','top-p':'0.9','top-k':'20','min-p':'0.0','presence-penalty':'0.0','repeat-penalty':'1.0'},
+    'general-agent': {'temp':'0.7','top-p':'0.9','top-k':'20','min-p':'0.0','presence-penalty':'0.0','repeat-penalty':'1.0'},
+    'creative': {'temp':'1.0','top-p':'0.95','top-k':'50','min-p':'0.0','presence-penalty':'0.2','repeat-penalty':'1.0'},
+}
+SAMPLING_KEYS = {'temp','top-p','top-k','min-p','presence-penalty','repeat-penalty'}
 
 
 def die(msg):
@@ -185,6 +192,8 @@ def cmd_add(a):
     if not model.exists(): die(f'model missing after install: {model}')
     backup_ini(); txt=set_section(read_ini(),a.name,default_block(a.name,model,mm)); INI.write_text(txt,encoding='utf-8')
     st=load_state(); ms=st.setdefault('models',{}).setdefault(a.name,{})
+    if not src.is_file():
+        ms['hf']={'repo':repo,'revision':rev,'file':f}
     if a.ctx=='auto': ms.update({'ctx_mode':'auto','fit_ctx':a.fit_ctx}); ms.pop('ctx_size',None)
     else: ms.update({'ctx_mode':'fixed','ctx_size':int(a.ctx)}); ms.pop('fit_ctx',None); txt=set_key(read_ini(),a.name,'ctx-size',str(int(a.ctx))); INI.write_text(txt,encoding='utf-8')
     save_state(st)
@@ -336,6 +345,187 @@ def cmd_export_opencode(a):
     for w in warnings: print('WARNING:',w,file=sys.stderr)
 
 
+
+def _hf_sampling(repo, revision='main'):
+    """Best-effort sampling defaults from HF generation_config.json or README."""
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        die('install huggingface_hub: python3 -m pip install --user -U huggingface_hub')
+    out={}
+    # Prefer machine-readable generation config.
+    try:
+        gp=Path(hf_hub_download(repo_id=repo, filename='generation_config.json', revision=revision))
+        g=json.loads(gp.read_text(encoding='utf-8'))
+        mapping={'temperature':'temp','top_p':'top-p','top_k':'top-k','min_p':'min-p','presence_penalty':'presence-penalty','repetition_penalty':'repeat-penalty'}
+        for src_key,dst_key in mapping.items():
+            if src_key in g and g[src_key] is not None:
+                out[dst_key]=str(g[src_key]).lower() if isinstance(g[src_key],bool) else str(g[src_key])
+    except Exception:
+        pass
+    if out:
+        return out,'generation_config.json'
+    # Fall back to common model-card wording. Conservative: only parse explicit key/value pairs.
+    try:
+        rp=Path(hf_hub_download(repo_id=repo, filename='README.md', revision=revision))
+        txt=rp.read_text(encoding='utf-8', errors='ignore')
+        pats={
+            'temp':[r'(?i)(?:temperature|temp)\s*[=:]\s*`?([0-9.]+)',r'(?i)temperature\s+of\s+`?([0-9.]+)'],
+            'top-p':[r'(?i)top[_ -]?p\s*[=:]\s*`?([0-9.]+)'],
+            'top-k':[r'(?i)top[_ -]?k\s*[=:]\s*`?([0-9]+)'],
+            'min-p':[r'(?i)min[_ -]?p\s*[=:]\s*`?([0-9.]+)'],
+            'presence-penalty':[r'(?i)presence[_ -]?penalty\s*[=:]\s*`?([0-9.]+)'],
+            'repeat-penalty':[r'(?i)(?:repetition|repeat)[_ -]?penalty\s*[=:]\s*`?([0-9.]+)'],
+        }
+        for k,arr in pats.items():
+            for pat in arr:
+                m=re.search(pat,txt)
+                if m:
+                    out[k]=m.group(1); break
+    except Exception:
+        pass
+    return out,'README.md' if out else None
+
+
+def cmd_sampling(a):
+    txt=read_ini(); sec=get_section(txt,a.name)
+    if not sec: die('profile not found')
+    v=values(sec); st=load_state(); ms=st.setdefault('models',{}).setdefault(a.name,{})
+    if a.preset is None or a.preset=='show':
+        current={k:v.get(k) for k in sorted(SAMPLING_KEYS) if k in v}
+        print(json.dumps({'current':current,'preset':ms.get('sampling_preset'),'source':ms.get('sampling_source')},indent=2)); return
+    preset=a.preset
+    if preset=='hf':
+        hf=ms.get('hf',{})
+        repo=a.repo or hf.get('repo')
+        rev=a.revision or hf.get('revision','main')
+        if not repo: die('no Hugging Face source recorded; pass --repo USER/REPO')
+        vals,source=_hf_sampling(repo,rev)
+        if not vals: die(f'no explicit sampling defaults found in {repo}@{rev}')
+        label='hf'; src=f'{repo}@{rev}:{source}'
+    else:
+        vals=SAMPLING_PRESETS[preset].copy(); label=preset; src='built-in fallback preset'
+    backup_ini()
+    for k,val in vals.items(): txt=set_key(txt,a.name,k,val)
+    INI.write_text(txt,encoding='utf-8')
+    ms['sampling_preset']=label; ms['sampling_source']=src; ms['sampling_values']=vals; save_state(st)
+    print(f'{a.name}: sampling={label} ({src})')
+    for k,val in vals.items(): print(f'  {k} = {val}')
+    if not a.no_restart: restart()
+
+
+def _device_for_bench():
+    st=load_state(); hw=st.get('hardware',{}); pinned=hw.get('device')
+    if pinned: return pinned
+    try:
+        r=run([str(SERVER),'--list-devices'],capture=True)
+        lines=r.stdout.splitlines()
+        mode=hw.get('backend','auto')
+        preferred=[]
+        if mode=='cuda' or mode=='auto': preferred += ['CUDA']
+        if mode in {'rocm','hip'} or mode=='auto': preferred += ['ROCm']
+        if mode=='vulkan' or mode=='auto': preferred += ['Vulkan']
+        for prefix in preferred:
+            for line in lines:
+                m=re.match(r'\s*('+re.escape(prefix)+r'\d+):',line)
+                if m: return m.group(1)
+    except Exception: pass
+    return 'auto'
+
+
+def _bench_once(bench, model, device, cfg, prompt, gen, timeout, fit_target):
+    cmd=[str(bench),'-m',str(model),'-p',str(prompt),'-n',str(gen),'-r','1','-o','json',
+         '-b',str(cfg['batch']),'-ub',str(cfg['ubatch']),'-ctk',cfg['ctk'],'-ctv',cfg['ctv'],'-fa',cfg['fa']]
+    if device == 'none':
+        cmd += ['-ngl','0']
+    else:
+        cmd += ['-dev',device,'-fitt',str(fit_target)]
+    try:
+        cp=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None,'timeout'
+    if cp.returncode!=0:
+        return None,'failed'
+    try: data=json.loads(cp.stdout)
+    except Exception: return None,'bad-json'
+    if isinstance(data,dict): data=[data]
+    pp=tg=None
+    for row in data:
+        t=row.get('test') or row.get('test_name') or ''
+        val=row.get('avg_ts') or row.get('avg_ts') or row.get('tokens_per_second')
+        if val is None:
+            # Current llama-bench JSON exposes avg_ts; older builds may expose samples.
+            sm=row.get('samples_ts') or row.get('samples')
+            if isinstance(sm,list) and sm: val=sum(map(float,sm))/len(sm)
+        if val is None: continue
+        if str(t).startswith('pp') or row.get('n_prompt',0): pp=float(val)
+        if str(t).startswith('tg') or row.get('n_gen',0): tg=float(val)
+    return {'pp':pp,'tg':tg},None
+
+
+def cmd_tune(a):
+    sec=get_section(read_ini(),a.name)
+    if not sec: die('profile not found')
+    v=values(sec); model=Path(v.get('model',''))
+    if not model.is_file(): die(f'model file not found: {model}')
+    bench=BUILD/'bin/llama-bench'
+    if not bench.exists(): die(f'{bench} not found; run llama-modelctl update')
+    # Adaptive budget by GGUF size; user may override.
+    gib=model.stat().st_size/(1024**3)
+    minutes=a.minutes
+    if minutes is None:
+        minutes=2 if gib<8 else 4 if gib<20 else 6 if gib<60 else 10
+    budget=max(60,int(minutes*60)); deadline=datetime.datetime.now().timestamp()+budget
+    device=a.device or _device_for_bench()
+    backend='rocm' if device.startswith('ROCm') else 'cuda' if device.startswith('CUDA') else 'vulkan' if device.startswith('Vulkan') else 'cpu'
+    hw=load_state().get('hardware',{}); prof=hw.get('profile','balanced')
+    if backend=='rocm': fit_target=4096 if prof=='capacity' else 8192
+    elif backend in {'cuda','vulkan'}: fit_target=768 if prof=='throughput' else 512 if prof=='capacity' else 1024
+    else: fit_target=0
+    # HX370/ROCm: F16 is mandatory policy. Else compare profile-compatible KV options.
+    kvs=[('f16','f16')] if backend=='rocm' else [('q8_0','q8_0'),('f16','f16'),('q4_0','q4_0')]
+    batches=[(128,128),(256,128),(512,256)]
+    fas=['on','off']
+    # Keep search bounded; throughput favors TG, capacity favors memory-safe configs, balanced combines PP/TG.
+    candidates=[]
+    for ctk,ctv in kvs:
+        for b,ub in batches:
+            for fa in fas:
+                candidates.append({'batch':b,'ubatch':ub,'ctk':ctk,'ctv':ctv,'fa':fa})
+    prompt=1024 if gib>60 else 2048
+    gen=64 if gib>60 else 96
+    results=[]
+    print(f'Tuning {a.name}: {gib:.1f} GiB, device={device}, budget={minutes:g} min, candidates={len(candidates)}')
+    for i,cfg in enumerate(candidates,1):
+        remain=int(deadline-datetime.datetime.now().timestamp())
+        if remain<20: break
+        per=min(max(20,remain//max(1,len(candidates)-i+1)),90)
+        print(f'[{i}/{len(candidates)}] b={cfg["batch"]} ub={cfg["ubatch"]} KV={cfg["ctk"]}/{cfg["ctv"]} FA={cfg["fa"]}')
+        perf,err=_bench_once(bench,model,device,cfg,prompt,gen,per,fit_target)
+        if perf:
+            pp=perf.get('pp') or 0; tg=perf.get('tg') or 0
+            if a.goal=='throughput': score=tg*0.8+pp*0.2/10
+            elif a.goal=='capacity': score=tg*0.4+pp*0.6/10
+            else: score=tg*0.65+pp*0.35/10
+            results.append({**cfg,**perf,'score':score}); print(f'  pp={pp:.2f} tg={tg:.2f} score={score:.2f}')
+        else: print(f'  skipped: {err}')
+    if not results: die('no benchmark candidate completed successfully')
+    results.sort(key=lambda x:x['score'],reverse=True); best=results[0]
+    print('\nBest: '+json.dumps(best,indent=2))
+    st=load_state(); ms=st.setdefault('models',{}).setdefault(a.name,{})
+    fp=f'{backend}:{device}'
+    ms.setdefault('tuning',{}).setdefault(fp,{})[a.goal]={'minutes':minutes,'best':best,'tested':results,'timestamp':datetime.datetime.now().isoformat(timespec='seconds')}
+    save_state(st)
+    if a.apply:
+        backup_ini(); txt=read_ini()
+        for k,val in [('batch-size',best['batch']),('ubatch-size',best['ubatch']),('flash-attn',best['fa']),('cache-type-k',best['ctk']),('cache-type-v',best['ctv'])]:
+            txt=set_key(txt,a.name,k,str(val))
+        INI.write_text(txt,encoding='utf-8')
+        ms.setdefault('cache_pref',{})['cache-type-k']=best['ctk']; ms.setdefault('cache_pref',{})['cache-type-v']=best['ctv']
+        ms.setdefault('perf_pref',{})['batch-size']=str(best['batch']); ms.setdefault('perf_pref',{})['ubatch-size']=str(best['ubatch']); save_state(st)
+        print('Applied best measured performance settings to llama-models.ini')
+        if not a.no_restart: restart()
+
 def cmd_devices(a): run([str(SERVER),'--list-devices'])
 def cmd_update(a):
     if not (REPO/'.git').exists(): die(f'{REPO} is not a git repo')
@@ -367,6 +557,8 @@ def main():
     q=sp.add_parser('set'); q.add_argument('name'); q.add_argument('key'); q.add_argument('value'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_set)
     q=sp.add_parser('unset'); q.add_argument('name'); q.add_argument('key'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_unset)
     q=sp.add_parser('export-opencode'); q.add_argument('--base-url',required=True,help='remote llama-server OpenAI-compatible URL, e.g. http://192.168.1.50:8080/v1'); q.add_argument('--output','-o'); q.add_argument('--provider',default='llama-local'); q.add_argument('--name',default='llama.cpp'); q.add_argument('--default-model'); q.add_argument('--auto-context',type=int,help='context limit exported for auto-fit models; default is conservative fit-ctx minimum'); q.set_defaults(func=cmd_export_opencode)
+    q=sp.add_parser('sampling'); q.add_argument('name'); q.add_argument('preset',nargs='?',choices=['show','hf',*sorted(SAMPLING_PRESETS)]); q.add_argument('--repo',help='HF repo override for preset=hf'); q.add_argument('--revision'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_sampling)
+    q=sp.add_parser('tune'); q.add_argument('name'); q.add_argument('--minutes',type=float,help='time budget; default adapts to model size'); q.add_argument('--goal',choices=['balanced','throughput','capacity'],default='balanced'); q.add_argument('--device',help='bench device override, e.g. CUDA0'); q.add_argument('--apply',action='store_true',help='apply the best measured performance settings'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_tune)
     q=sp.add_parser('update'); q.add_argument('--backends',default='all',help='all or comma list: cuda,hip/rocm,vulkan,cpu'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_update)
     a=p.parse_args(); a.func(a)
 if __name__=='__main__': main()
