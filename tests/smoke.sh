@@ -65,6 +65,7 @@ export LLAMA_SERVER="$T/bin/llama-server"
 export LLAMA_MODELCTL_STATE="$T/home/.config/llama-modelctl/state.json"
 export LLAMA_CPP_DIR="$T/repo"
 export LLAMA_MODELS_DIR="$T/models"
+export LLAMA_MODELCTL_TEST_FAST=1
 
 python3 "$ROOT/bin/llama-hw-select" >/dev/null
 grep -q '^device = CUDA0$' "$LLAMA_MODELS_INI"
@@ -112,3 +113,31 @@ grep -q '^cache-type-k = q8_0$' <<<"$Q"
 grep -q '^flash-attn = on$' <<<"$Q"
 
 echo "smoke tests: OK"
+
+# v0.5: tune all models across all detected backends, keep environment fingerprints.
+python3 "$ROOT/bin/llama-modelctl" tune '*' --all-backends --minutes 0.01 --goal balanced --yes --no-restart >/dev/null
+python3 - <<'PY'
+import json,os
+s=json.load(open(os.environ['LLAMA_MODELCTL_STATE']))
+m=s['models']['qwen']
+profiles=m.get('tuning_profiles',{})
+assert len(profiles) >= 4, profiles
+backends={r['backend'] for r in profiles.values() if r.get('goal')=='balanced'}
+assert {'cuda','rocm','vulkan'} <= backends, backends
+for r in profiles.values():
+    assert 'environment' in r and 'model_fingerprint' in r and 'compat_id' in r
+    e=r['environment']
+    assert 'os' in e and 'kernel' in e and 'cpu' in e and 'drivers' in e and 'llama_cpp' in e
+PY
+
+# Exact environment profiles should be reusable by the boot selector.
+python3 - <<'PY'
+import json,os
+p=os.environ['LLAMA_MODELCTL_STATE']; s=json.load(open(p)); s['hardware']={'backend':'cuda','profile':'balanced'}; json.dump(s,open(p,'w'))
+PY
+python3 "$ROOT/bin/llama-hw-select" >/dev/null
+Q="$(awk '/\[qwen\]/{f=1;next} /^\[/{f=0} f' "$LLAMA_MODELS_INI")"
+grep -q '^batch-size = 128$' <<<"$Q"
+grep -q '^cache-type-k = q8_0$' <<<"$Q"
+
+echo "v0.5 environment/tune-all tests: OK"

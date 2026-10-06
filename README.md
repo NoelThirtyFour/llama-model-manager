@@ -313,7 +313,9 @@ The uninstaller removes the tools and systemd integration. It does not delete mo
 
 ## Adaptive tuning
 
-`llama-modelctl` can benchmark a model for a short, bounded period and keep the best measured settings for the current hardware.
+`llama-modelctl` can benchmark one model or every installed generative model and keep the best measured settings for each hardware/software environment.
+
+### Tune one model
 
 ```bash
 llama-modelctl tune qwen38-iq3s
@@ -330,18 +332,105 @@ If `--minutes` is omitted, the budget adapts to GGUF size:
 | 20-60 GiB | ~6 min |
 | over 60 GiB | ~10 min |
 
-The tuner measures only settings for which a speed benchmark is meaningful:
+### Tune every installed model
+
+```bash
+llama-modelctl tune --all --goal throughput --apply
+```
+
+`'*'` is an alias, but quote it so the shell does not expand it:
+
+```bash
+llama-modelctl tune '*' --goal throughput --apply
+```
+
+Before starting, modelctl prints a rough job list and estimated total duration, then asks for confirmation.
+
+```text
+Models detected: 8 | tuning jobs: 8 | goal=throughput
+  qwen38-27b-oq3-ora              CUDA0    ~4 min
+  deepseek-v4-flash-iq2           CUDA0    ~10 min
+  ...
+Estimated total: ~42 min (rough range 32-57 min)
+Start tuning? [y/N]
+```
+
+Useful batch options:
+
+```bash
+llama-modelctl tune --all --dry-run
+llama-modelctl tune --all --yes
+llama-modelctl tune --all --changed --apply
+llama-modelctl tune --all --resume --apply
+```
+
+Embeddings and rerankers are skipped, and duplicate presets pointing at the exact same GGUF are benchmarked only once.
+
+### Tune several backends/devices
+
+Benchmark every detected CUDA, ROCm and Vulkan device:
+
+```bash
+llama-modelctl tune qwen38-iq3s --all-backends
+llama-modelctl tune --all --all-backends --apply
+```
+
+Include CPU as an additional reference:
+
+```bash
+llama-modelctl tune --all --all-backends --include-cpu
+```
+
+Or restrict the run:
+
+```bash
+llama-modelctl tune qwen38-iq3s --backends cuda,rocm
+llama-modelctl tune qwen38-iq3s --backends cuda,vulkan
+llama-modelctl tune qwen38-iq3s --device CUDA0
+```
+
+CUDA and Vulkan on the same physical NVIDIA GPU are intentionally kept as separate benchmark profiles.
+
+### What is tuned
+
+The tuner measures only parameters for which a speed benchmark is meaningful:
 
 - batch size / micro-batch size
 - KV cache format
 - Flash Attention
 - GPU memory fitting on the selected backend
 
-Results are stored separately for each backend/device and goal. A result measured on `CUDA0` is therefore not reused as an HX370/ROCm result. When a matching result exists, the boot selector can reuse it automatically.
+On AMD/HX370, the runtime KV policy remains **F16/F16** even if a CUDA or Vulkan result prefers Q8 or Q4.
 
-On AMD/HX370, the runtime KV policy remains **F16/F16** even if a CUDA tuning result prefers Q8 or Q4.
+> `llama-bench` does not measure answer quality. Temperature, top-k, top-p, penalties and other sampling parameters are managed separately by `llama-modelctl sampling`.
 
-> `llama-bench` does not measure answer quality. The tuner deliberately does not optimize temperature, top-k, top-p, penalties, or other sampling parameters.
+### Tuning fingerprints
+
+Results are never identified only by `CUDA0` or by a commercial GPU name. Each result records the conditions under which it was measured, including:
+
+- OS distribution/version and kernel
+- CPU model and logical thread count
+- RAM size
+- memory type/speed when readable without blocking the run
+- backend, device name and VRAM/UMA size
+- NVIDIA / ROCm / Vulkan driver information when available
+- `llama.cpp` Git commit
+- CMake/compiler information
+- GGUF path, size, mtime and quick content fingerprint
+- tuning goal (`balanced`, `throughput`, or `capacity`)
+
+A new RTX 3090 therefore creates a new tuning profile instead of replacing the existing RTX 3060 or HX370 profile. If the RTX 3060 is reinstalled later, its previous matching profile can be reused.
+
+A driver, kernel, `llama.cpp`, model file, CPU/RAM or GPU change can make an old result stale. Old measurements are kept for history, but the boot selector will not blindly apply a non-matching v0.5 profile and will print `retune recommended`.
+
+Inspect stored conditions:
+
+```bash
+llama-modelctl tuning
+llama-modelctl tuning qwen38-iq3s
+llama-modelctl tuning qwen38-iq3s --json
+```
+
 
 ## Sampling presets
 

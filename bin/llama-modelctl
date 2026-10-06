@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, datetime, fnmatch, json, os, re, shutil, subprocess, sys
+import argparse, datetime, fnmatch, hashlib, json, os, platform, re, shutil, subprocess, sys
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
@@ -34,6 +34,171 @@ def run(cmd, *, capture=False, check=True, cwd=None):
     return subprocess.run(list(map(str, cmd)), text=True, cwd=cwd,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.STDOUT if capture else None, check=check)
+
+
+
+def _capture(cmd):
+    try:
+        cp=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=3)
+        return cp.stdout.strip() if cp.returncode==0 else ''
+    except Exception:
+        return ''
+
+
+def _os_release():
+    out={}
+    try:
+        for line in Path('/etc/os-release').read_text(encoding='utf-8').splitlines():
+            if '=' in line:
+                k,v=line.split('=',1); out[k]=v.strip().strip('"')
+    except Exception:
+        pass
+    return {'id':out.get('ID'),'version_id':out.get('VERSION_ID'),'pretty_name':out.get('PRETTY_NAME')}
+
+
+def _cpu_model():
+    txt=_capture(['lscpu'])
+    m=re.search(r'(?mi)^Model name:\s*(.+)$',txt)
+    if m: return m.group(1).strip()
+    try:
+        for line in Path('/proc/cpuinfo').read_text(errors='ignore').splitlines():
+            if line.lower().startswith('model name'):
+                return line.split(':',1)[1].strip()
+    except Exception:
+        pass
+    return platform.processor() or 'unknown'
+
+
+def _ram_bytes():
+    try:
+        m=re.search(r'(?m)^MemTotal:\s*(\d+)\s+kB',Path('/proc/meminfo').read_text())
+        return int(m.group(1))*1024 if m else None
+    except Exception:
+        return None
+
+
+def _memory_details():
+    # Best effort only. dmidecode often needs root, so missing values are normal.
+    details={'type':None,'speed_mts':None}
+    txt=_capture(['dmidecode','--type','memory']) if shutil.which('dmidecode') else ''
+    if txt:
+        types=[x.strip() for x in re.findall(r'(?mi)^\s*Type:\s*(DDR\w*|LPDDR\w*)\s*$',txt)]
+        speeds=[int(x) for x in re.findall(r'(?mi)^\s*(?:Configured Memory Speed|Speed):\s*(\d+)\s*MT/s',txt)]
+        if types: details['type']=max(set(types),key=types.count)
+        if speeds: details['speed_mts']=max(speeds)
+    return details
+
+
+def _llama_commit():
+    return _capture(['git','-C',str(REPO),'rev-parse','HEAD']) if (REPO/'.git').exists() else ''
+
+
+def _tool_versions():
+    nvidia=''
+    if shutil.which('nvidia-smi'):
+        x=_capture(['nvidia-smi','--query-gpu=driver_version','--format=csv,noheader'])
+        nvidia=x.splitlines()[0].strip() if x else ''
+    cuda=''
+    if shutil.which('nvcc'):
+        x=_capture(['nvcc','--version']); m=re.search(r'release\s+([0-9.]+)',x); cuda=m.group(1) if m else x.splitlines()[-1] if x else ''
+    rocm=''
+    if shutil.which('hipconfig'):
+        x=_capture(['hipconfig','--version']); rocm=x.splitlines()[0] if x else ''
+    vulkan=''
+    if shutil.which('vulkaninfo'):
+        x=_capture(['vulkaninfo','--summary']);
+        lines=[ln.strip() for ln in x.splitlines() if re.search(r'(?i)(driver|api version|mesa)',ln)]
+        vulkan=' | '.join(lines[:8])
+    return {'nvidia':nvidia or None,'cuda':cuda or None,'rocm':rocm or None,'vulkan':vulkan or None}
+
+
+def _compiler_versions():
+    cm=_capture(['cmake','--version']).splitlines()
+    cc=''
+    for exe in ('cc','gcc','clang'):
+        if shutil.which(exe):
+            x=_capture([exe,'--version']).splitlines(); cc=x[0] if x else ''; break
+    return {'cmake':cm[0] if cm else None,'compiler':cc or None}
+
+
+def _device_inventory():
+    try:
+        cp=subprocess.run([str(SERVER),'--list-devices'],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=10)
+        text=cp.stdout
+    except Exception:
+        return []
+    out=[]
+    rx=re.compile(r'^\s*(\w+\d+):\s*(.*?)\s*\((\d+) MiB,\s*(\d+) MiB free\)\s*$',re.M)
+    for m in rx.finditer(text):
+        out.append({'id':m.group(1),'name':m.group(2),'total_mib':int(m.group(3)),'free_mib':int(m.group(4))})
+    return out
+
+
+def _backend_for_device(device):
+    if device.startswith('CUDA'): return 'cuda'
+    if device.startswith('ROCm'): return 'rocm'
+    if device.startswith('Vulkan'): return 'vulkan'
+    return 'cpu'
+
+
+_ENV_BASE_CACHE = None
+
+def _environment_base():
+    global _ENV_BASE_CACHE
+    if _ENV_BASE_CACHE is None:
+        mem=_memory_details()
+        _ENV_BASE_CACHE={
+            'os':_os_release(), 'kernel':platform.release(), 'machine':platform.machine(),
+            'cpu':{'model':_cpu_model(),'logical_threads':os.cpu_count(),'ram_bytes':_ram_bytes(),'memory_type':mem.get('type'),'memory_speed_mts':mem.get('speed_mts')},
+            'drivers':_tool_versions(), 'llama_cpp':{'commit':_llama_commit()}, 'build':_compiler_versions(),
+        }
+    return json.loads(json.dumps(_ENV_BASE_CACHE))
+
+
+def _environment_snapshot(device, device_info=None):
+    inv=_device_inventory() if device_info is None else []
+    if device_info is None:
+        device_info=next((d for d in inv if d['id']==device), {'id':device,'name':'CPU' if device=='none' else device,'total_mib':0,'free_mib':0})
+    base=_environment_base()
+    base.update({
+        'device':{'id':device_info.get('id'),'name':device_info.get('name'),'total_mib':device_info.get('total_mib')},
+        'backend':_backend_for_device(device),
+    })
+    return base
+
+
+def _model_fingerprint(path):
+    st=path.stat(); h=hashlib.sha256()
+    with path.open('rb') as f:
+        head=f.read(1024*1024); h.update(head)
+        if st.st_size>1024*1024:
+            try: f.seek(max(0,st.st_size-1024*1024)); h.update(f.read(1024*1024))
+            except Exception: pass
+    return {'path':str(path.resolve()),'size':st.st_size,'mtime_ns':st.st_mtime_ns,'quick_sha256':h.hexdigest()}
+
+
+def _compat_id(environment, model_fp, goal):
+    # Use conditions that are stable and readable both interactively and from systemd.
+    # Optional DMI memory type/speed is stored in metadata but not required for matching.
+    backend=environment.get('backend')
+    drivers=environment.get('drivers',{})
+    relevant_driver={
+        'cuda': {'nvidia':drivers.get('nvidia')},
+        'rocm': {'rocm':drivers.get('rocm')},
+        'vulkan': {'vulkan':drivers.get('vulkan')},
+        'cpu': {},
+    }.get(backend,{})
+    cpu=environment.get('cpu',{})
+    stable_env={
+        'os':environment.get('os'), 'kernel':environment.get('kernel'), 'machine':environment.get('machine'),
+        'cpu':{'model':cpu.get('model'),'logical_threads':cpu.get('logical_threads'),'ram_bytes':cpu.get('ram_bytes')},
+        'device':environment.get('device'), 'backend':backend, 'drivers':relevant_driver,
+        'llama_cpp':environment.get('llama_cpp'),
+    }
+    payload={'environment':stable_env,'model':model_fp,'goal':goal}
+    raw=json.dumps(payload,sort_keys=True,separators=(',',':')).encode()
+    return hashlib.sha256(raw).hexdigest()[:20]
+
 
 def load_state():
     if not STATE.exists(): return {'models': {}}
@@ -463,39 +628,105 @@ def _bench_once(bench, model, device, cfg, prompt, gen, timeout, fit_target):
     return {'pp':pp,'tg':tg},None
 
 
-def cmd_tune(a):
-    sec=get_section(read_ini(),a.name)
-    if not sec: die('profile not found')
-    v=values(sec); model=Path(v.get('model',''))
-    if not model.is_file(): die(f'model file not found: {model}')
-    bench=BUILD/'bin/llama-bench'
-    if not bench.exists(): die(f'{bench} not found; run llama-modelctl update')
-    # Adaptive budget by GGUF size; user may override.
+def _adaptive_minutes(model):
     gib=model.stat().st_size/(1024**3)
-    minutes=a.minutes
-    if minutes is None:
-        minutes=2 if gib<8 else 4 if gib<20 else 6 if gib<60 else 10
-    budget=max(60,int(minutes*60)); deadline=datetime.datetime.now().timestamp()+budget
-    device=a.device or _device_for_bench()
-    backend='rocm' if device.startswith('ROCm') else 'cuda' if device.startswith('CUDA') else 'vulkan' if device.startswith('Vulkan') else 'cpu'
-    hw=load_state().get('hardware',{}); prof=hw.get('profile','balanced')
-    if backend=='rocm': fit_target=4096 if prof=='capacity' else 8192
-    elif backend in {'cuda','vulkan'}: fit_target=768 if prof=='throughput' else 512 if prof=='capacity' else 1024
-    else: fit_target=0
-    # HX370/ROCm: F16 is mandatory policy. Else compare profile-compatible KV options.
+    return 2 if gib<8 else 4 if gib<20 else 6 if gib<60 else 10
+
+
+def _fit_target_for(device, goal='balanced'):
+    if device.startswith('ROCm'):
+        return 4096 if goal=='capacity' else 8192
+    if device.startswith('CUDA') or device.startswith('Vulkan'):
+        return 512 if goal=='capacity' else 768 if goal=='throughput' else 1024
+    return 0
+
+
+def _candidate_set(backend):
+    if os.environ.get('LLAMA_MODELCTL_TEST_FAST')=='1':
+        kv=('f16','f16') if backend=='rocm' else ('q8_0','q8_0')
+        return [{'batch':128,'ubatch':128,'ctk':kv[0],'ctv':kv[1],'fa':'on'}]
     kvs=[('f16','f16')] if backend=='rocm' else [('q8_0','q8_0'),('f16','f16'),('q4_0','q4_0')]
     batches=[(128,128),(256,128),(512,256)]
     fas=['on','off']
-    # Keep search bounded; throughput favors TG, capacity favors memory-safe configs, balanced combines PP/TG.
-    candidates=[]
-    for ctk,ctv in kvs:
-        for b,ub in batches:
-            for fa in fas:
-                candidates.append({'batch':b,'ubatch':ub,'ctk':ctk,'ctv':ctv,'fa':fa})
+    return [{'batch':b,'ubatch':ub,'ctk':ctk,'ctv':ctv,'fa':fa}
+            for ctk,ctv in kvs for b,ub in batches for fa in fas]
+
+
+def _score_result(perf, goal):
+    pp=perf.get('pp') or 0; tg=perf.get('tg') or 0
+    if goal=='throughput': return tg*0.8+pp*0.2/10
+    if goal=='capacity': return tg*0.4+pp*0.6/10
+    return tg*0.65+pp*0.35/10
+
+
+def _available_tune_devices(a):
+    inv=_device_inventory()
+    if a.device:
+        d=next((x for x in inv if x['id'].lower()==a.device.lower()),None)
+        if not d: die(f'device not detected: {a.device}')
+        return [d]
+    if getattr(a,'all_backends',False):
+        return inv + ([{'id':'none','name':'CPU','total_mib':0,'free_mib':0}] if getattr(a,'include_cpu',False) else [])
+    if getattr(a,'backends',None):
+        wanted={x.strip().lower() for x in a.backends.split(',') if x.strip()}
+        wanted={'rocm' if x=='hip' else x for x in wanted}
+        bad=wanted-{'cuda','rocm','vulkan','cpu'}
+        if bad: die('unknown backend(s): '+', '.join(sorted(bad)))
+        out=[d for d in inv if _backend_for_device(d['id']) in wanted]
+        if 'cpu' in wanted: out.append({'id':'none','name':'CPU','total_mib':0,'free_mib':0})
+        if not out: die('none of the requested backends are available')
+        return out
+    device=_device_for_bench()
+    if device=='auto':
+        return [inv[0]] if inv else [{'id':'none','name':'CPU','total_mib':0,'free_mib':0}]
+    d=next((x for x in inv if x['id']==device),None)
+    return [d or {'id':device,'name':device,'total_mib':0,'free_mib':0}]
+
+
+def _tunable_models(all_models=False, one_name=None):
+    txt=read_ini(); rows=[]; seen=set()
+    names=[n for n in re.findall(r'(?m)^\[([^]]+)\]\s*$',txt) if n!='*']
+    if not all_models:
+        names=[one_name]
+    for name in names:
+        sec=get_section(txt,name)
+        if not sec:
+            if not all_models: die(f'profile not found: {name}')
+            continue
+        v=values(sec)
+        if v.get('embeddings','').lower() in {'1','true','on','yes'} or v.get('reranking','').lower() in {'1','true','on','yes'}:
+            continue
+        model=Path(v.get('model',''))
+        if not model.is_file():
+            if not all_models: die(f'model file not found: {model}')
+            print(f'WARNING: skip {name}: model not found: {model}',file=sys.stderr); continue
+        key=str(model.resolve())
+        if all_models and key in seen: continue
+        seen.add(key); rows.append((name,v,model))
+    return rows
+
+
+def _has_exact_tuning(ms, env, model_fp, goal):
+    cid=_compat_id(env,model_fp,goal)
+    return cid in ms.get('tuning_profiles',{})
+
+
+def _tune_one(name, v, model, device_info, goal, minutes, apply, no_restart=True):
+    bench=BUILD/'bin/llama-bench'
+    if not bench.exists(): die(f'{bench} not found; run llama-modelctl update')
+    device=device_info['id']; backend=_backend_for_device(device)
+    gib=model.stat().st_size/(1024**3)
+    minutes=minutes if minutes is not None else _adaptive_minutes(model)
+    budget=max(60,int(minutes*60)); deadline=datetime.datetime.now().timestamp()+budget
+    fit_target=_fit_target_for(device,goal)
+    candidates=_candidate_set(backend)
     prompt=1024 if gib>60 else 2048
     gen=64 if gib>60 else 96
+    env=_environment_snapshot(device,device_info)
+    model_fp=_model_fingerprint(model)
+    cid=_compat_id(env,model_fp,goal)
     results=[]
-    print(f'Tuning {a.name}: {gib:.1f} GiB, device={device}, budget={minutes:g} min, candidates={len(candidates)}')
+    print(f'\nTuning {name}: {gib:.1f} GiB, device={device} ({device_info.get("name")}), goal={goal}, budget={minutes:g} min, candidates={len(candidates)}')
     for i,cfg in enumerate(candidates,1):
         remain=int(deadline-datetime.datetime.now().timestamp())
         if remain<20: break
@@ -503,28 +734,110 @@ def cmd_tune(a):
         print(f'[{i}/{len(candidates)}] b={cfg["batch"]} ub={cfg["ubatch"]} KV={cfg["ctk"]}/{cfg["ctv"]} FA={cfg["fa"]}')
         perf,err=_bench_once(bench,model,device,cfg,prompt,gen,per,fit_target)
         if perf:
-            pp=perf.get('pp') or 0; tg=perf.get('tg') or 0
-            if a.goal=='throughput': score=tg*0.8+pp*0.2/10
-            elif a.goal=='capacity': score=tg*0.4+pp*0.6/10
-            else: score=tg*0.65+pp*0.35/10
-            results.append({**cfg,**perf,'score':score}); print(f'  pp={pp:.2f} tg={tg:.2f} score={score:.2f}')
+            score=_score_result(perf,goal); row={**cfg,**perf,'score':score}; results.append(row)
+            print(f'  pp={(perf.get("pp") or 0):.2f} tg={(perf.get("tg") or 0):.2f} score={score:.2f}')
         else: print(f'  skipped: {err}')
-    if not results: die('no benchmark candidate completed successfully')
+    if not results:
+        return {'name':name,'device':device,'ok':False,'reason':'no benchmark candidate completed successfully'}
     results.sort(key=lambda x:x['score'],reverse=True); best=results[0]
-    print('\nBest: '+json.dumps(best,indent=2))
-    st=load_state(); ms=st.setdefault('models',{}).setdefault(a.name,{})
-    fp=f'{backend}:{device}'
-    ms.setdefault('tuning',{}).setdefault(fp,{})[a.goal]={'minutes':minutes,'best':best,'tested':results,'timestamp':datetime.datetime.now().isoformat(timespec='seconds')}
+    st=load_state(); ms=st.setdefault('models',{}).setdefault(name,{})
+    rec={'compat_id':cid,'goal':goal,'minutes':minutes,'backend':backend,'device':device_info,'environment':env,'model_fingerprint':model_fp,'best':best,'tested':results,'timestamp':datetime.datetime.now().isoformat(timespec='seconds')}
+    ms.setdefault('tuning_profiles',{})[cid]=rec
+    # Keep v0.4 compact index for compatibility with older hw-select versions.
+    ms.setdefault('tuning',{}).setdefault(f'{backend}:{device}',{})[goal]={'minutes':minutes,'best':best,'tested':results,'timestamp':rec['timestamp']}
     save_state(st)
-    if a.apply:
+    print('Best: '+json.dumps(best,indent=2))
+    if apply:
         backup_ini(); txt=read_ini()
         for k,val in [('batch-size',best['batch']),('ubatch-size',best['ubatch']),('flash-attn',best['fa']),('cache-type-k',best['ctk']),('cache-type-v',best['ctv'])]:
-            txt=set_key(txt,a.name,k,str(val))
+            txt=set_key(txt,name,k,str(val))
         INI.write_text(txt,encoding='utf-8')
+        st=load_state(); ms=st.setdefault('models',{}).setdefault(name,{})
         ms.setdefault('cache_pref',{})['cache-type-k']=best['ctk']; ms.setdefault('cache_pref',{})['cache-type-v']=best['ctv']
         ms.setdefault('perf_pref',{})['batch-size']=str(best['batch']); ms.setdefault('perf_pref',{})['ubatch-size']=str(best['ubatch']); save_state(st)
         print('Applied best measured performance settings to llama-models.ini')
-        if not a.no_restart: restart()
+        if not no_restart: restart()
+    return {'name':name,'device':device,'ok':True,'best':best,'compat_id':cid,'minutes':minutes}
+
+
+def _estimate_plan(models, devices, override_minutes):
+    items=[]; total=0.0
+    for name,v,model in models:
+        mins=override_minutes if override_minutes is not None else _adaptive_minutes(model)
+        for d in devices:
+            items.append((name,model,d,mins)); total+=mins
+    return items,total
+
+
+def cmd_tune(a):
+    all_models=bool(getattr(a,'all',False) or a.name=='*')
+    if not all_models and not a.name: die('provide MODEL, "*", or --all')
+    models=_tunable_models(all_models, a.name)
+    devices=_available_tune_devices(a)
+    plan,total=_estimate_plan(models,devices,a.minutes)
+    st=load_state()
+    if getattr(a,'changed',False) or getattr(a,'resume',False):
+        filtered=[]
+        for name,model,d,mins in plan:
+            env=_environment_snapshot(d['id'],d); mf=_model_fingerprint(model); ms=st.get('models',{}).get(name,{})
+            if _has_exact_tuning(ms,env,mf,a.goal):
+                continue
+            filtered.append((name,model,d,mins))
+        plan=filtered; total=sum(x[3] for x in plan)
+    print(f'Hardware targets: {", ".join(d["id"]+"/"+d.get("name","") for d in devices)}')
+    print(f'Models detected: {len(models)} | tuning jobs: {len(plan)} | goal={a.goal}')
+    for name,model,d,mins in plan:
+        print(f'  {name:42} {d["id"]:8} ~{mins:g} min  {model.stat().st_size/(1024**3):.1f} GiB')
+    print(f'Estimated total: ~{total:.0f} min (rough range {max(1,total*0.75):.0f}-{max(1,total*1.35):.0f} min)')
+    if getattr(a,'dry_run',False): return
+    if (all_models or len(plan)>1) and not getattr(a,'yes',False):
+        try: ans=input('Start tuning? [y/N] ').strip().lower()
+        except EOFError: ans=''
+        if ans not in {'y','yes'}:
+            print('Cancelled.'); return
+    results=[]
+    model_map={name:(v,model) for name,v,model in models}
+    for idx,(name,model,d,mins) in enumerate(plan,1):
+        print(f'\n=== Job {idx}/{len(plan)} ===')
+        v,_=model_map[name]
+        try: results.append(_tune_one(name,v,model,d,a.goal,mins,a.apply,no_restart=True))
+        except Exception as e:
+            results.append({'name':name,'device':d['id'],'ok':False,'reason':str(e)})
+            print(f'WARNING: {name}/{d["id"]} failed: {e}',file=sys.stderr)
+    if a.apply and not a.no_restart: restart()
+    print('\n=== Tuning summary ===')
+    ok=sum(1 for x in results if x.get('ok')); fail=len(results)-ok
+    print(f'completed={ok} failed={fail} skipped_existing={len(_estimate_plan(models,devices,a.minutes)[0])-len(plan)}')
+    for x in results:
+        if x.get('ok'):
+            b=x['best']; print(f'  OK   {x["name"]:36} {x["device"]:8} PP={(b.get("pp") or 0):.2f} TG={(b.get("tg") or 0):.2f}')
+        else: print(f'  FAIL {x["name"]:36} {x["device"]:8} {x.get("reason","")}')
+
+
+
+def cmd_tuning(a):
+    st=load_state(); models=st.get('models',{})
+    names=[a.name] if a.name else sorted(models)
+    payload={}
+    for name in names:
+        prof=models.get(name,{}).get('tuning_profiles',{})
+        if prof: payload[name]=prof
+    if a.json:
+        print(json.dumps(payload,indent=2,ensure_ascii=False)); return
+    if not payload:
+        print('No v0.5 tuning profiles stored.'); return
+    for name,profiles in payload.items():
+        print(f'\n{name}')
+        for cid,r in sorted(profiles.items(), key=lambda kv: kv[1].get('timestamp','')):
+            e=r.get('environment',{}); cpu=e.get('cpu',{}); dev=r.get('device',{}); drv=e.get('drivers',{}); best=r.get('best',{})
+            ram=cpu.get('ram_bytes'); ram_txt=f'{ram/(1024**3):.1f} GiB' if ram else '?'
+            backend=r.get('backend','?'); driver=drv.get('nvidia') if backend=='cuda' else drv.get('rocm') if backend=='rocm' else drv.get('vulkan') if backend=='vulkan' else None
+            print(f'  {cid}  {r.get("goal","?"):10} {dev.get("id","?"):8} {dev.get("name","?")}')
+            print(f'    PP={(best.get("pp") or 0):.2f} TG={(best.get("tg") or 0):.2f}  b/ub={best.get("batch")}/{best.get("ubatch")} KV={best.get("ctk")}/{best.get("ctv")} FA={best.get("fa")}')
+            print(f'    CPU={cpu.get("model","?")} | RAM={ram_txt} | memory={cpu.get("memory_type") or "?"} {cpu.get("memory_speed_mts") or "?"} MT/s')
+            print(f'    OS={e.get("os",{}).get("pretty_name") or e.get("os",{}).get("id") or "?"} | kernel={e.get("kernel","?")} | driver={driver or "?"}')
+            print(f'    llama.cpp={e.get("llama_cpp",{}).get("commit","")[:12] or "?"} | {r.get("timestamp","")}')
+
 
 def cmd_devices(a): run([str(SERVER),'--list-devices'])
 def cmd_update(a):
@@ -558,7 +871,8 @@ def main():
     q=sp.add_parser('unset'); q.add_argument('name'); q.add_argument('key'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_unset)
     q=sp.add_parser('export-opencode'); q.add_argument('--base-url',required=True,help='remote llama-server OpenAI-compatible URL, e.g. http://192.168.1.50:8080/v1'); q.add_argument('--output','-o'); q.add_argument('--provider',default='llama-local'); q.add_argument('--name',default='llama.cpp'); q.add_argument('--default-model'); q.add_argument('--auto-context',type=int,help='context limit exported for auto-fit models; default is conservative fit-ctx minimum'); q.set_defaults(func=cmd_export_opencode)
     q=sp.add_parser('sampling'); q.add_argument('name'); q.add_argument('preset',nargs='?',choices=['show','hf',*sorted(SAMPLING_PRESETS)]); q.add_argument('--repo',help='HF repo override for preset=hf'); q.add_argument('--revision'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_sampling)
-    q=sp.add_parser('tune'); q.add_argument('name'); q.add_argument('--minutes',type=float,help='time budget; default adapts to model size'); q.add_argument('--goal',choices=['balanced','throughput','capacity'],default='balanced'); q.add_argument('--device',help='bench device override, e.g. CUDA0'); q.add_argument('--apply',action='store_true',help='apply the best measured performance settings'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_tune)
+    q=sp.add_parser('tune'); q.add_argument('name',nargs='?'); q.add_argument('--all',action='store_true',help='tune all installed generative models'); q.add_argument('--minutes',type=float,help='time budget per model/backend; default adapts to model size'); q.add_argument('--goal',choices=['balanced','throughput','capacity'],default='balanced'); q.add_argument('--device',help='bench one exact device, e.g. CUDA0'); q.add_argument('--all-backends',action='store_true',help='test every detected CUDA/ROCm/Vulkan device'); q.add_argument('--backends',help='comma list: cuda,rocm/hip,vulkan,cpu'); q.add_argument('--include-cpu',action='store_true',help='include CPU with --all-backends'); q.add_argument('--changed',action='store_true',help='only tune missing/stale environment+model fingerprints'); q.add_argument('--resume',action='store_true',help='skip jobs already tuned for this exact environment'); q.add_argument('--dry-run',action='store_true',help='show jobs and rough duration only'); q.add_argument('--yes','-y',action='store_true',help='skip confirmation'); q.add_argument('--apply',action='store_true',help='apply the best measured performance settings'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_tune)
+    q=sp.add_parser('tuning'); q.add_argument('name',nargs='?'); q.add_argument('--json',action='store_true'); q.set_defaults(func=cmd_tuning)
     q=sp.add_parser('update'); q.add_argument('--backends',default='all',help='all or comma list: cuda,hip/rocm,vulkan,cpu'); q.add_argument('--no-restart',action='store_true'); q.set_defaults(func=cmd_update)
     a=p.parse_args(); a.func(a)
 if __name__=='__main__': main()

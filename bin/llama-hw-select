@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, re, subprocess, sys
+import hashlib, json, os, platform, re, shutil, subprocess, sys
 from pathlib import Path
 
 HOME = Path(os.environ.get('LLAMA_HOME', str(Path.home())))
@@ -23,6 +23,104 @@ def load_state():
         return json.loads(STATE.read_text(encoding='utf-8'))
     except Exception as e:
         die(f'invalid state file {STATE}: {e}')
+
+
+
+
+def _capture(cmd):
+    try:
+        cp=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=3)
+        return cp.stdout.strip() if cp.returncode==0 else ''
+    except Exception:
+        return ''
+
+
+def _os_release():
+    out={}
+    try:
+        for line in Path('/etc/os-release').read_text(encoding='utf-8').splitlines():
+            if '=' in line:
+                k,v=line.split('=',1); out[k]=v.strip().strip('"')
+    except Exception:
+        pass
+    return {'id':out.get('ID'),'version_id':out.get('VERSION_ID'),'pretty_name':out.get('PRETTY_NAME')}
+
+
+def _cpu_model():
+    txt=_capture(['lscpu'])
+    m=re.search(r'(?mi)^Model name:\s*(.+)$',txt)
+    if m: return m.group(1).strip()
+    try:
+        for line in Path('/proc/cpuinfo').read_text(errors='ignore').splitlines():
+            if line.lower().startswith('model name'):
+                return line.split(':',1)[1].strip()
+    except Exception:
+        pass
+    return platform.processor() or 'unknown'
+
+
+def _ram_bytes():
+    try:
+        m=re.search(r'(?m)^MemTotal:\s*(\d+)\s+kB',Path('/proc/meminfo').read_text())
+        return int(m.group(1))*1024 if m else None
+    except Exception:
+        return None
+
+
+def _llama_commit():
+    repo=SERVER.parents[2] if len(SERVER.parents)>=3 else Path.home()/'llama.cpp'
+    return _capture(['git','-C',str(repo),'rev-parse','HEAD']) if (repo/'.git').exists() else ''
+
+
+def _drivers():
+    nvidia=''
+    if shutil.which('nvidia-smi'):
+        x=_capture(['nvidia-smi','--query-gpu=driver_version','--format=csv,noheader'])
+        nvidia=x.splitlines()[0].strip() if x else ''
+    rocm=''
+    if Path('/opt/rocm/.info/version').exists():
+        try: rocm=Path('/opt/rocm/.info/version').read_text().strip()
+        except Exception: pass
+    elif shutil.which('hipconfig'):
+        x=_capture(['hipconfig','--version']); rocm=x.splitlines()[0] if x else ''
+    vulkan=''
+    if shutil.which('vulkaninfo'):
+        x=_capture(['vulkaninfo','--summary'])
+        lines=[ln.strip() for ln in x.splitlines() if re.search(r'(?i)(driver|api version|mesa)',ln)]
+        vulkan=' | '.join(lines[:8])
+    return {'nvidia':nvidia or None,'rocm':rocm or None,'vulkan':vulkan or None}
+
+
+def _environment_snapshot(device_info):
+    did=device_info.get('id','none')
+    backend='cuda' if did.startswith('CUDA') else 'rocm' if did.startswith('ROCm') else 'vulkan' if did.startswith('Vulkan') else 'cpu'
+    return {
+        'os':_os_release(), 'kernel':platform.release(), 'machine':platform.machine(),
+        'cpu':{'model':_cpu_model(),'logical_threads':os.cpu_count(),'ram_bytes':_ram_bytes()},
+        'device':{'id':did,'name':device_info.get('name'),'total_mib':device_info.get('total') or device_info.get('total_mib') or 0},
+        'backend':backend, 'drivers':_drivers(), 'llama_cpp':{'commit':_llama_commit()},
+    }
+
+
+def _model_fingerprint(path):
+    st=path.stat(); h=hashlib.sha256()
+    with path.open('rb') as f:
+        h.update(f.read(1024*1024))
+        if st.st_size>1024*1024:
+            try: f.seek(max(0,st.st_size-1024*1024)); h.update(f.read(1024*1024))
+            except Exception: pass
+    return {'path':str(path.resolve()),'size':st.st_size,'mtime_ns':st.st_mtime_ns,'quick_sha256':h.hexdigest()}
+
+
+def _compat_id(environment, model_fp, goal):
+    backend=environment.get('backend'); drivers=environment.get('drivers',{})
+    relevant={'cuda':{'nvidia':drivers.get('nvidia')},'rocm':{'rocm':drivers.get('rocm')},'vulkan':{'vulkan':drivers.get('vulkan')},'cpu':{}}.get(backend,{})
+    cpu=environment.get('cpu',{})
+    stable={'os':environment.get('os'),'kernel':environment.get('kernel'),'machine':environment.get('machine'),
+            'cpu':{'model':cpu.get('model'),'logical_threads':cpu.get('logical_threads'),'ram_bytes':cpu.get('ram_bytes')},
+            'device':environment.get('device'),'backend':backend,'drivers':relevant,'llama_cpp':environment.get('llama_cpp')}
+    raw=json.dumps({'environment':stable,'model':model_fp,'goal':goal},sort_keys=True,separators=(',',':')).encode()
+    return hashlib.sha256(raw).hexdigest()[:20]
 
 
 def parse_devices(text):
@@ -156,6 +254,8 @@ def main():
         die('missing [*] global section')
 
     replacements = {}
+    stale_tuning = []
+    selected_env = _environment_snapshot(selected)
     for start, end, name in ranges:
         if name == '*':
             if is_cpu:
@@ -193,7 +293,20 @@ def main():
                 perf_pref[pk] = current[pk]
 
         backend_key = 'rocm' if device.startswith('ROCm') else 'cuda' if device.startswith('CUDA') else 'vulkan' if device.startswith('Vulkan') else 'cpu'
-        tuned = model_state.get('tuning',{}).get(f'{backend_key}:{device}',{}).get(profile,{}).get('best',{})
+        tuned = {}
+        model_path = Path(current.get('model',''))
+        new_profiles = model_state.get('tuning_profiles',{})
+        if model_path.is_file() and new_profiles:
+            try:
+                cid = _compat_id(selected_env, _model_fingerprint(model_path), profile)
+                tuned = new_profiles.get(cid,{}).get('best',{})
+                if not tuned:
+                    stale_tuning.append(name)
+            except Exception:
+                stale_tuning.append(name)
+        elif not new_profiles:
+            # Backward compatibility with v0.4 state.
+            tuned = model_state.get('tuning',{}).get(f'{backend_key}:{device}',{}).get(profile,{}).get('best',{})
         if tuned:
             updates['batch-size'] = str(tuned.get('batch', perf_pref.get('batch-size','512')))
             updates['ubatch-size'] = str(tuned.get('ubatch', perf_pref.get('ubatch-size','256')))
@@ -253,6 +366,10 @@ def main():
     kv_mode = 'F16/F16 forced' if is_amd else 'per-model preference'
     ngl = '0' if is_cpu else 'auto'
     print(f'[llama-hw-select] backend={backend_mode} profile={profile} device={device} ({device_name}) fit-target={fit_target} MiB n-gpu-layers={ngl} KV={kv_mode}')
+    if stale_tuning:
+        uniq=sorted(set(stale_tuning))
+        shown=', '.join(uniq[:8]) + (' ...' if len(uniq)>8 else '')
+        print(f'[llama-hw-select] tuning environment changed or missing for {len(uniq)} model(s): {shown}; retune recommended')
 
 if __name__ == '__main__':
     main()

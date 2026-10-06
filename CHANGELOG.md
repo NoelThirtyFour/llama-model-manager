@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0
+
+- Add `tune --all` and `tune '*'` to benchmark every installed generative model sequentially.
+- Add `--all-backends`, `--backends`, and `--device` tuning targets for CUDA, ROCm/HIP, Vulkan, and optional CPU comparisons.
+- Add rough pre-run duration estimates, interactive confirmation, `--dry-run`, and `--yes`.
+- Add `--changed` / `--resume` so existing exact environment profiles are skipped.
+- Store every tuning result under a compatibility fingerprint instead of overwriting older GPU results.
+- Record tuning conditions: OS, kernel, CPU, logical threads, RAM, best-effort memory type/speed, GPU/backend/VRAM, relevant drivers, llama.cpp commit, CMake/compiler, and model fingerprint.
+- A new GPU such as an RTX 3090 therefore adds a new profile while existing RTX 3060 and HX370 results remain available.
+- Boot-time tuning reuse now requires an exact stable environment/model match; stale results are kept but reported as `retune recommended`.
+- Add `llama-modelctl tuning [MODEL] [--json]` to inspect stored benchmark conditions and results.
+- Keep HX370/ROCm runtime KV forced to F16/F16 regardless of CUDA/Vulkan tuning history.
+
 ## 0.4.0
 
 - Add `llama-modelctl tune MODEL` with an adaptive time budget based on GGUF size.
