@@ -225,6 +225,9 @@ llama-modelctl remove qwen38-iq3s --files
 
 ## Update llama.cpp
 
+`llama-modelctl update` auto-detects the CUDA compiler when CUDA is requested. If an existing `build-all/CMakeCache.txt` references a removed CUDA toolkit, the stale CMake cache is refreshed automatically and the detected `nvcc` is passed explicitly to CMake.
+
+
 Build all supported GPU backends:
 
 ```bash

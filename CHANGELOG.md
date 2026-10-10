@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.1
+
+- Fix `llama-modelctl update` when the CMake cache points to a CUDA `nvcc` path that no longer exists.
+- Auto-detect a valid `nvcc` from `CUDACXX`, `PATH`, `/usr/local/cuda*`, or `/opt/cuda*`.
+- Refresh only the stale CMake cache when the CUDA compiler changes.
+- Pass the detected compiler explicitly with `-DCMAKE_CUDA_COMPILER=...`.
+- Replace Python tracebacks from failed external build commands with concise modelctl errors.
+
 ## 0.5.0
 
 - Add `tune --all` and `tune '*'` to benchmark every installed generative model sequentially.

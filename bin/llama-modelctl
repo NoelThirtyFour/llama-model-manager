@@ -31,10 +31,61 @@ def die(msg):
 
 def run(cmd, *, capture=False, check=True, cwd=None):
     print('+', ' '.join(map(str, cmd)))
-    return subprocess.run(list(map(str, cmd)), text=True, cwd=cwd,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.STDOUT if capture else None, check=check)
+    try:
+        return subprocess.run(list(map(str, cmd)), text=True, cwd=cwd,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.STDOUT if capture else None, check=check)
+    except subprocess.CalledProcessError as e:
+        if check:
+            die(f'command failed with exit code {e.returncode}: {' '.join(map(str, cmd))}')
+        raise
 
+
+def _valid_executable(path):
+    try:
+        p=Path(path).expanduser()
+        return p.is_file() and os.access(p, os.X_OK)
+    except Exception:
+        return False
+
+
+def _find_nvcc():
+    # Prefer an explicit user override, then PATH, then common toolkit locations.
+    candidates=[]
+    for key in ('CUDACXX','CUDA_NVCC_EXECUTABLE'):
+        if os.environ.get(key): candidates.append(os.environ[key])
+    w=shutil.which('nvcc')
+    if w: candidates.append(w)
+    candidates += ['/usr/local/cuda/bin/nvcc','/opt/cuda/bin/nvcc']
+    for root in ('/usr/local','/opt'):
+        try:
+            candidates += [str(x) for x in sorted(Path(root).glob('cuda-*/bin/nvcc'), reverse=True)]
+        except Exception:
+            pass
+    seen=set()
+    for c in candidates:
+        if not c or c in seen: continue
+        seen.add(c)
+        if _valid_executable(c): return str(Path(c).resolve())
+    return None
+
+
+def _cached_cmake_value(key):
+    cache=BUILD/'CMakeCache.txt'
+    if not cache.is_file(): return None
+    try:
+        m=re.search(rf'(?m)^{re.escape(key)}:[^=]*=(.*)$',cache.read_text(errors='ignore'))
+        return m.group(1).strip() if m else None
+    except Exception:
+        return None
+
+
+def _drop_cmake_cache(reason):
+    print(f'[update] refreshing CMake cache: {reason}')
+    for p in (BUILD/'CMakeCache.txt', BUILD/'cmake_install.cmake'):
+        try: p.unlink()
+        except FileNotFoundError: pass
+    shutil.rmtree(BUILD/'CMakeFiles', ignore_errors=True)
 
 
 def _capture(cmd):
@@ -847,13 +898,32 @@ def cmd_update(a):
     requested={'hip' if x=='rocm' else x for x in requested}
     bad=requested-{'cuda','hip','vulkan','cpu'}
     if bad: die('unknown build backend(s): '+', '.join(sorted(bad)))
+
+    nvcc=None
+    if 'cuda' in requested:
+        nvcc=_find_nvcc()
+        cached=_cached_cmake_value('CMAKE_CUDA_COMPILER')
+        if not nvcc:
+            extra=f' (cached path is {cached})' if cached else ''
+            die('CUDA build requested but no executable nvcc was found'+extra+'. Install/repair the CUDA toolkit, or run update --backends hip,vulkan.')
+        if cached and Path(cached) != Path(nvcc):
+            if not _valid_executable(cached):
+                _drop_cmake_cache(f'stale CUDA compiler {cached} -> {nvcc}')
+            else:
+                print(f'[update] CUDA compiler changed: {cached} -> {nvcc}')
+                _drop_cmake_cache('CUDA compiler changed')
+        print(f'[update] nvcc: {nvcc}')
+
     run(['git','-C',REPO,'pull','--ff-only'])
     args=['cmake','-S',REPO,'-B',BUILD,'-G','Ninja','-DCMAKE_BUILD_TYPE=Release','-DGGML_BACKEND_DL=ON',
           f"-DGGML_CUDA={'ON' if 'cuda' in requested else 'OFF'}",
           f"-DGGML_HIP={'ON' if 'hip' in requested else 'OFF'}",
           f"-DGGML_VULKAN={'ON' if 'vulkan' in requested else 'OFF'}",
           '-DGGML_NATIVE=OFF']
-    run(args); run(['cmake','--build',BUILD,'-j',str(os.cpu_count() or 4)])
+    if nvcc:
+        args.append(f'-DCMAKE_CUDA_COMPILER={nvcc}')
+    run(args)
+    run(['cmake','--build',BUILD,'-j',str(os.cpu_count() or 4)])
     run([str(SERVER),'--list-devices'])
     if not a.no_restart: restart()
 
